@@ -48,7 +48,7 @@
 use std::io::Cursor;
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_core::{NullCodecResolver, ReadSeek};
+use oxideav_core::{Demuxer as _, NullCodecResolver, ReadSeek};
 
 /// Bound on how many packets we drain per fuzz input. A pathological
 /// but legitimate stream (e.g. a one-sample-per-chunk track with a
@@ -64,7 +64,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(data.to_vec()));
-    let Ok(mut dmx) = oxideav_mp4::demux::open(rs, &NullCodecResolver) else {
+    let Ok(mut dmx) = oxideav_mp4::demux::open_typed(rs, &NullCodecResolver) else {
         return;
     };
 
@@ -75,6 +75,14 @@ fuzz_target!(|data: &[u8]| {
     let _ = dmx.streams().len();
     let _ = dmx.metadata().len();
     let _ = dmx.duration_micros();
+    let _ = dmx.empty_duration_records().len();
+
+    // Re-walk the input for the senc-less CENC aux-info carriage:
+    // attacker-controlled `saiz` sizes + `saio` offsets drive seeks,
+    // a bounded (≤ 16 MiB, input-backed) allocation, and the §7.1
+    // per-sample cell parser. Both Ok(n) and Err(_) are fine; what
+    // may not happen is a panic or an unbounded allocation.
+    let _ = dmx.resolve_sai_aux_info();
 
     // Drain packets up to MAX_PACKETS_PER_INPUT. The loop terminates
     // on the first error (Eof, invalid, ...) — fuzz inputs are

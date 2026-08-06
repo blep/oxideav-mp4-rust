@@ -1104,7 +1104,7 @@ pub(crate) fn default_samples_per_chunk(stream: &StreamInfo) -> u32 {
     // compressed codecs samples are ~20ms each.
     match stream.params.media_type {
         MediaType::Audio => {
-            // 1 chunk per ~50 samples is a common ffmpeg-ish default for
+            // 1 chunk per ~50 samples is a common ecosystem default for
             // compressed audio. For PCM (single huge packet), 1 sample/chunk
             // is fine.
             if stream.params.codec_id.as_str().starts_with("pcm_") {

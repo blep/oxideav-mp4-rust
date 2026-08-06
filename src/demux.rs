@@ -221,7 +221,13 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     }
     let moov = moov.ok_or_else(|| Error::invalid("MP4: missing moov box"))?;
 
-    let mut parsed = parse_moov(&moov)?;
+    // Established before the moov walk: several sample-table entry
+    // counts (most notably the constant-size `stsz` shape, whose
+    // sample_count is backed by no table bytes at all) are validated
+    // against the input size so a forged 32-bit count cannot drive a
+    // multi-GiB allocation from a small file.
+    let file_size = input.seek(std::io::SeekFrom::End(0))?;
+    let mut parsed = parse_moov(&moov, file_size)?;
     if parsed.tracks.is_empty() {
         return Err(Error::invalid("MP4: no tracks"));
     }
@@ -273,6 +279,18 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // tracks by cross-multiplication so differing timescales order
     // correctly); `None` for a moof that added no timed samples.
     let mut moof_earliest: Vec<Option<(i64, u32)>> = Vec::with_capacity(moofs.len());
+    // Whole-file sample budget: no fragmented file can materialize
+    // more samples than it has bytes (every legitimate sample costs at
+    // least one input byte somewhere — a per-sample trun field, mdat
+    // payload, or box structure). `parse_trun` charges each declared
+    // `sample_count` against this budget, so a forged 32-bit count in
+    // a defaults-only trun (zero wire bytes per sample) cannot drive
+    // a multi-GiB `SampleRef`/`TrunSample` allocation from a small
+    // input. The floor keeps degenerate-but-legal tiny files working.
+    let mut sample_budget: u64 = {
+        let end = input.seek(std::io::SeekFrom::End(0))?;
+        end.max(4096)
+    };
     for moof in &moofs {
         let before = samples.len();
         parse_moof(
@@ -287,6 +305,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             &mut piff_senc_records,
             &mut piff_moof_psshes,
             &mut empty_durations,
+            &mut sample_budget,
         )?;
         let mut best: Option<(i64, u32)> = None;
         for s in &samples[before..] {
@@ -762,6 +781,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
 
     Ok(Mp4Demuxer {
         input,
+        input_len: file_size,
         streams,
         samples,
         cursor: 0,
@@ -2861,7 +2881,7 @@ struct TrexDefaults {
     default_sample_flags: u32,
 }
 
-fn parse_moov(moov: &[u8]) -> Result<ParsedMoov> {
+fn parse_moov(moov: &[u8], file_size: u64) -> Result<ParsedMoov> {
     let mut out = ParsedMoov::default();
     let mut cur = std::io::Cursor::new(moov);
     let end = moov.len() as u64;
@@ -2875,7 +2895,7 @@ fn parse_moov(moov: &[u8]) -> Result<ParsedMoov> {
         match hdr.fourcc {
             TRAK => {
                 let body = read_bytes_vec(&mut cur, psz)?;
-                if let Some(t) = parse_trak(&body)? {
+                if let Some(t) = parse_trak(&body, file_size)? {
                     out.tracks.push(t);
                 }
             }
@@ -5285,7 +5305,7 @@ pub fn parse_meco_box(body: &[u8]) -> MecoBox {
     out
 }
 
-fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
+fn parse_trak(body: &[u8], file_size: u64) -> Result<Option<Track>> {
     let mut t = Track {
         track_id: 0,
         media_type: MediaType::Unknown,
@@ -5364,7 +5384,7 @@ fn parse_trak(body: &[u8]) -> Result<Option<Track>> {
             }
             MDIA => {
                 let sub = read_bytes_vec(&mut cur, psz)?;
-                parse_mdia(&sub, &mut t)?;
+                parse_mdia(&sub, &mut t, file_size)?;
                 has_media = true;
             }
             EDTS => {
@@ -6213,7 +6233,7 @@ fn parse_elst_into(body: &[u8], out: &mut Vec<ElstEntry>) -> Result<()> {
     let count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
     let entry_size = if version == 1 { 20 } else { 12 };
     let mut off = 8;
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = Vec::with_capacity(count.min(body.len() / 12));
     for _ in 0..count {
         if off + entry_size > body.len() {
             return Err(Error::invalid("MP4: elst truncated"));
@@ -6398,7 +6418,7 @@ pub fn build_elst_box(entries: &[EditListEntry]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn parse_mdia(body: &[u8], t: &mut Track) -> Result<()> {
+fn parse_mdia(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
     while cur.position() < end {
@@ -6422,7 +6442,7 @@ fn parse_mdia(body: &[u8], t: &mut Track) -> Result<()> {
             }
             MINF => {
                 let b = read_bytes_vec(&mut cur, psz)?;
-                parse_minf(&b, t)?;
+                parse_minf(&b, t, file_size)?;
             }
             _ => skip_cursor_bytes(&mut cur, psz),
         }
@@ -6504,7 +6524,7 @@ fn parse_hdlr(body: &[u8], t: &mut Track) -> Result<()> {
     Ok(())
 }
 
-fn parse_minf(body: &[u8], t: &mut Track) -> Result<()> {
+fn parse_minf(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
     while cur.position() < end {
@@ -6516,7 +6536,7 @@ fn parse_minf(body: &[u8], t: &mut Track) -> Result<()> {
         match hdr.fourcc {
             STBL => {
                 let sub = read_bytes_vec(&mut cur, psz)?;
-                parse_stbl(&sub, t)?;
+                parse_stbl(&sub, t, file_size)?;
             }
             VMHD => {
                 let sub = read_bytes_vec(&mut cur, psz)?;
@@ -7166,7 +7186,7 @@ pub fn build_load_settings_box(r: &LoadSettingsBox) -> Vec<u8> {
     wrap_box(&LOAD, &body)
 }
 
-fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
+fn parse_stbl(body: &[u8], t: &mut Track, file_size: u64) -> Result<()> {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
     while cur.position() < end {
@@ -7180,7 +7200,7 @@ fn parse_stbl(body: &[u8], t: &mut Track) -> Result<()> {
             STSD => parse_stsd(&b, t)?,
             STTS => t.stts = parse_stts(&b)?,
             STSC => t.stsc = parse_stsc(&b)?,
-            STSZ => t.stsz = parse_stsz(&b)?,
+            STSZ => t.stsz = parse_stsz(&b, file_size)?,
             STZ2 => t.stsz = parse_stz2(&b)?,
             STCO => t.chunk_offsets = parse_stco(&b)?,
             CO64 => t.chunk_offsets = parse_co64(&b)?,
@@ -8100,7 +8120,9 @@ fn parse_stts(body: &[u8]) -> Result<Vec<(u32, u32)>> {
         return Err(Error::invalid("MP4: stts too short"));
     }
     let count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
-    let mut out = Vec::with_capacity(count);
+    // 8 bytes per entry on the wire — cap the reservation at what the
+    // body can back.
+    let mut out = Vec::with_capacity(count.min(body.len() / 8));
     let mut off = 8;
     for _ in 0..count {
         if off + 8 > body.len() {
@@ -8119,7 +8141,7 @@ fn parse_stsc(body: &[u8]) -> Result<Vec<(u32, u32, u32)>> {
         return Err(Error::invalid("MP4: stsc too short"));
     }
     let count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(body.len() / 12));
     let mut off = 8;
     for _ in 0..count {
         if off + 12 > body.len() {
@@ -8135,16 +8157,29 @@ fn parse_stsc(body: &[u8]) -> Result<Vec<(u32, u32, u32)>> {
     Ok(out)
 }
 
-fn parse_stsz(body: &[u8]) -> Result<Vec<u32>> {
+fn parse_stsz(body: &[u8], file_size: u64) -> Result<Vec<u32>> {
     if body.len() < 12 {
         return Err(Error::invalid("MP4: stsz too short"));
     }
     let uniform = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
     let count = u32::from_be_bytes([body[8], body[9], body[10], body[11]]) as usize;
     if uniform != 0 {
+        // Constant-size shape: the count is backed by no table bytes,
+        // but every claimed sample must occupy `uniform` bytes of this
+        // file's mdat — so `count × uniform` can never exceed the file
+        // size. Rejecting beyond that stops a forged 32-bit count from
+        // driving a multi-GiB materialisation from a tiny input.
+        if (count as u64).saturating_mul(uniform as u64) > file_size {
+            return Err(Error::invalid(
+                "MP4: stsz constant-size sample_count exceeds what the file can back",
+            ));
+        }
         return Ok(vec![uniform; count]);
     }
-    let mut out = Vec::with_capacity(count);
+    // Per-sample shape: one u32 per sample — cap the reservation at
+    // what the table bytes can back (the loop still reports precise
+    // truncation).
+    let mut out = Vec::with_capacity(count.min(body.len() / 4));
     let mut off = 12;
     for _ in 0..count {
         if off + 4 > body.len() {
@@ -8167,7 +8202,7 @@ fn parse_stz2(body: &[u8]) -> Result<Vec<u32>> {
     }
     let field_size = body[7];
     let count = u32::from_be_bytes([body[8], body[9], body[10], body[11]]) as usize;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(body.len().saturating_mul(2)));
     let off = 12;
     match field_size {
         4 => {
@@ -8206,7 +8241,7 @@ fn parse_stss(body: &[u8]) -> Result<Vec<u32>> {
         return Err(Error::invalid("MP4: stss too short"));
     }
     let count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(body.len() / 4));
     let mut off = 8;
     for _ in 0..count {
         if off + 4 > body.len() {
@@ -8792,7 +8827,7 @@ fn parse_ctts(body: &[u8]) -> Result<Vec<(u32, i32)>> {
     }
     let version = body[0];
     let count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(body.len() / 8));
     let mut off = 8;
     for _ in 0..count {
         if off + 8 > body.len() {
@@ -9274,7 +9309,7 @@ fn parse_stco(body: &[u8]) -> Result<Vec<u64>> {
         return Err(Error::invalid("MP4: stco too short"));
     }
     let count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(body.len() / 4));
     let mut off = 8;
     for _ in 0..count {
         if off + 4 > body.len() {
@@ -9293,7 +9328,7 @@ fn parse_co64(body: &[u8]) -> Result<Vec<u64>> {
         return Err(Error::invalid("MP4: co64 too short"));
     }
     let count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(body.len() / 8));
     let mut off = 8;
     for _ in 0..count {
         if off + 8 > body.len() {
@@ -9623,6 +9658,7 @@ fn parse_moof(
     piff_senc_records: &mut Vec<PiffSencRecord>,
     piff_moof_psshes: &mut Vec<MoofPsshRecord>,
     empty_durations: &mut Vec<EmptyDurationRecord>,
+    sample_budget: &mut u64,
 ) -> Result<()> {
     let mut cur = std::io::Cursor::new(&moof.body);
     let end = moof.body.len() as u64;
@@ -9666,6 +9702,7 @@ fn parse_moof(
                     traf_sample_groups,
                     piff_senc_records,
                     empty_durations,
+                    sample_budget,
                 )?;
             }
             PSSH => {
@@ -9913,6 +9950,7 @@ fn parse_traf(
     traf_sample_groups: &mut Vec<TrafSampleGroupRecord>,
     piff_senc_records: &mut Vec<PiffSencRecord>,
     empty_durations: &mut Vec<EmptyDurationRecord>,
+    sample_budget: &mut u64,
 ) -> Result<()> {
     // First pass: read tfhd + tfdt before the trun(s) so each trun
     // has the full default context. Also pick up senc (ISO/IEC 23001-7
@@ -10173,7 +10211,7 @@ fn parse_traf(
             continue;
         }
         let b = read_bytes_vec(&mut cur, psz)?;
-        let parsed = parse_trun(&b)?;
+        let parsed = parse_trun(&b, sample_budget)?;
 
         // Resolve the run's starting data offset:
         // * explicit data_offset present → relative to base_data_offset
@@ -10398,17 +10436,27 @@ struct ParsedTrun {
 /// optional data_offset (i32), optional first_sample_flags (u32),
 /// then sample_count repeats of the per-sample optional fields in the
 /// fixed order: duration, size, flags, composition_time_offset.
-fn parse_trun(body: &[u8]) -> Result<ParsedTrun> {
+fn parse_trun(body: &[u8], sample_budget: &mut u64) -> Result<ParsedTrun> {
     if body.len() < 8 {
         return Err(Error::invalid("MP4: trun too short"));
     }
     let version = body[0];
     let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
     let sample_count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    // §8.8.8.2 `sample_count` is attacker-controlled and — in the
+    // defaults-only shape, where no per-sample field flag is set —
+    // backed by zero wire bytes, so it must clear the whole-file
+    // sample budget before anything is allocated for it. Runs with
+    // per-sample fields are additionally validated against the body
+    // length below.
+    if sample_count as u64 > *sample_budget {
+        return Err(Error::invalid(
+            "MP4: trun sample_count exceeds input-backed sample budget",
+        ));
+    }
     let mut off = 8usize;
 
     let mut out = ParsedTrun::default();
-    out.samples.reserve(sample_count);
 
     if flags & TRUN_DATA_OFFSET_PRESENT != 0 {
         if off + 4 > body.len() {
@@ -10443,6 +10491,9 @@ fn parse_trun(body: &[u8]) -> Result<ParsedTrun> {
     if off + needed > body.len() {
         return Err(Error::invalid("MP4: trun samples truncated"));
     }
+    // Both validations passed — charge the budget and reserve.
+    *sample_budget -= sample_count as u64;
+    out.samples.reserve(sample_count);
 
     for _ in 0..sample_count {
         let mut s = TrunSample::default();
@@ -10474,8 +10525,10 @@ fn parse_trun(body: &[u8]) -> Result<ParsedTrun> {
             off += 4;
         }
         if flags & TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS_PRESENT != 0 {
-            // v0: u32, v1: i32. We always store i32 — the round-trip
-            // wraps the bit pattern, matching ffmpeg / libisobmff.
+            // v0: u32, v1: i32 (§8.8.8.2 — one shared 32-bit width,
+            // unsigned in v0 and signed in v1). We always store i32,
+            // preserving the bit pattern; a v0 value above i32::MAX
+            // (beyond any practical composition offset) wraps.
             let raw = [body[off], body[off + 1], body[off + 2], body[off + 3]];
             let v = if version == 0 {
                 u32::from_be_bytes(raw) as i32
@@ -11192,11 +11245,13 @@ fn parse_tfra(body: &[u8]) -> Result<Option<TfraRecord>> {
     }
     let n = u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]) as usize;
     off += 4;
-    let mut entries = Vec::with_capacity(n);
     let entry_size = if version == 1 { 16 } else { 8 } + len_traf + len_trun + len_sample;
     if off + n.saturating_mul(entry_size) > body.len() {
         return Err(Error::invalid("MP4: tfra entries truncated"));
     }
+    // Reserve only after the count is validated against the body —
+    // a forged 32-bit entry_count must not drive the allocation.
+    let mut entries = Vec::with_capacity(n);
     for _ in 0..n {
         let (time, moof_offset) = if version == 1 {
             let t = u64::from_be_bytes([
@@ -12827,6 +12882,9 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
 /// identical through either construction path.
 pub struct Mp4Demuxer {
     input: Box<dyn ReadSeek>,
+    /// Total input length in bytes (established at `open`). Used to
+    /// reject sample sizes the input cannot back before allocating.
+    input_len: u64,
     streams: Vec<StreamInfo>,
     samples: Vec<SampleRef>,
     cursor: usize,
@@ -13231,8 +13289,20 @@ impl Mp4Demuxer {
                     continue;
                 }
                 let count = sz.sample_count as usize;
+                // §7.1 empty-aux (constant-IV, no subsamples) carries
+                // nothing to fetch; a forged multi-GiB total is rejected
+                // BEFORE any allocation — including the sizes scratch
+                // vector itself, whose length is the attacker-controlled
+                // sample_count in the constant-size shape (u8-wide cells
+                // legitimately cap at 255 bytes/sample).
+                const MAX_AUX_TOTAL: usize = 16 * 1024 * 1024;
                 let sizes: Vec<usize> = if sz.default_sample_info_size != 0 {
-                    vec![sz.default_sample_info_size as usize; count]
+                    let cell = sz.default_sample_info_size as usize;
+                    match count.checked_mul(cell) {
+                        Some(total) if total <= MAX_AUX_TOTAL => {}
+                        _ => continue,
+                    }
+                    vec![cell; count]
                 } else {
                     if sz.per_sample.len() < count {
                         continue;
@@ -13240,11 +13310,7 @@ impl Mp4Demuxer {
                     sz.per_sample[..count].iter().map(|&b| b as usize).collect()
                 };
                 let total: usize = sizes.iter().sum();
-                // §7.1 empty-aux (constant-IV, no subsamples) carries
-                // nothing to fetch; a forged multi-hundred-MiB total is
-                // rejected before allocation (u8-wide cells legitimately
-                // cap at 255 bytes/sample).
-                if total == 0 || total > 16 * 1024 * 1024 {
+                if total == 0 || total > MAX_AUX_TOTAL {
                     continue;
                 }
                 let Some(abs) = r.base_data_offset.checked_add(so.offsets[0]) else {
@@ -13486,6 +13552,22 @@ impl Demuxer for Mp4Demuxer {
         let s = self.samples[self.cursor];
         self.cursor += 1;
         self.last_sdi = Some(s.sdi);
+        // A forged sample size (stsz / trun) cannot exceed what the
+        // input actually holds past the sample's offset — reject
+        // before allocating the payload buffer (`read_exact` would
+        // fail anyway, but only after a potentially multi-GiB
+        // allocation the file could never back). The cursor has
+        // already advanced, so — exactly as with a short read — the
+        // next call moves on to the following sample.
+        match s.offset.checked_add(s.size as u64) {
+            Some(end) if end <= self.input_len => {}
+            _ => {
+                return Err(Error::invalid(format!(
+                    "MP4: sample at offset {} with size {} exceeds input length {}",
+                    s.offset, s.size, self.input_len
+                )));
+            }
+        }
         self.input.seek(SeekFrom::Start(s.offset))?;
         let mut data = vec![0u8; s.size as usize];
         self.input.read_exact(&mut data)?;
@@ -15151,7 +15233,8 @@ mod tests {
             body.extend_from_slice(&dur.to_be_bytes());
             body.extend_from_slice(&sz.to_be_bytes());
         }
-        let parsed = super::parse_trun(&body).unwrap();
+        let mut budget = u64::MAX;
+        let parsed = super::parse_trun(&body, &mut budget).unwrap();
         assert_eq!(parsed.data_offset, Some(0x12345678));
         assert_eq!(parsed.samples.len(), 3);
         assert_eq!(parsed.samples[0].duration, Some(100));
@@ -15173,7 +15256,8 @@ mod tests {
         body.extend_from_slice(&2u32.to_be_bytes()); // sample_count
         body.extend_from_slice(&(-50i32).to_be_bytes());
         body.extend_from_slice(&(75i32).to_be_bytes());
-        let parsed = super::parse_trun(&body).unwrap();
+        let mut budget = u64::MAX;
+        let parsed = super::parse_trun(&body, &mut budget).unwrap();
         assert_eq!(parsed.samples[0].composition_time_offset, Some(-50));
         assert_eq!(parsed.samples[1].composition_time_offset, Some(75));
     }
@@ -15832,7 +15916,7 @@ mod tests {
         trak.extend(wrap_box_full_size(b"mdia", &mdia));
         trak.extend(wrap_box_full_size(b"trgr", &trgr_body));
 
-        let t = super::parse_trak(&trak).unwrap().unwrap();
+        let t = super::parse_trak(&trak, 1 << 30).unwrap().unwrap();
         assert_eq!(t.trgr.len(), 1);
         assert_eq!(&t.trgr[0].0, b"msrc");
         assert_eq!(t.trgr[0].1, 555);
@@ -15951,7 +16035,7 @@ mod tests {
         mdia.extend(wrap_box_full_size(b"elng", &elng));
 
         let mut t = fresh_track();
-        super::parse_mdia(&mdia, &mut t).unwrap();
+        super::parse_mdia(&mdia, &mut t, 1 << 30).unwrap();
         assert_eq!(t.timescale, 1000);
         assert_eq!(t.elng.as_deref(), Some("es-419"));
     }
@@ -16180,7 +16264,7 @@ mod tests {
         trak.extend(wrap_box_full_size(b"mdia", &mdia));
         trak.extend(wrap_box_full_size(b"udta", &udta));
 
-        let t = super::parse_trak(&trak).unwrap().unwrap();
+        let t = super::parse_trak(&trak, 1 << 30).unwrap().unwrap();
         assert_eq!(t.track_id, 7);
         assert_eq!(t.kinds.len(), 1);
         assert_eq!(t.kinds[0].0, "urn:mpeg:dash:role:2011");
@@ -16466,7 +16550,7 @@ mod tests {
         trak.extend(wrap_box_full_size(b"mdia", &mdia));
         trak.extend(wrap_box_full_size(b"udta", &udta));
 
-        let t = super::parse_trak(&trak).unwrap().unwrap();
+        let t = super::parse_trak(&trak, 1 << 30).unwrap().unwrap();
         assert_eq!(t.track_id, 11);
         assert_eq!(t.copyrights.len(), 1);
         assert_eq!(&t.copyrights[0].language, b"eng");
@@ -16736,7 +16820,7 @@ mod tests {
         trak.extend(wrap_box_full_size(b"mdia", &mdia));
         trak.extend(wrap_box_full_size(b"udta", &udta));
 
-        let t = super::parse_trak(&trak).unwrap().unwrap();
+        let t = super::parse_trak(&trak, 1 << 30).unwrap().unwrap();
         assert_eq!(t.track_id, 13);
         let tb = t.tsel.as_ref().unwrap();
         assert_eq!(tb.switch_group, 100);
@@ -17115,7 +17199,7 @@ mod tests {
         trak.extend(wrap_box_full_size(b"mdia", &mdia));
         trak.extend(wrap_box_full_size(b"udta", &udta));
 
-        let t = super::parse_trak(&trak).unwrap().unwrap();
+        let t = super::parse_trak(&trak, 1 << 30).unwrap().unwrap();
         assert_eq!(t.track_id, 21);
         assert_eq!(t.sub_tracks.len(), 1);
         let st = &t.sub_tracks[0];
@@ -17204,7 +17288,7 @@ mod tests {
         stbl.extend(wrap_box_full_size(b"cslg", &cslg));
 
         let mut t = fresh_track();
-        super::parse_stbl(&stbl, &mut t).unwrap();
+        super::parse_stbl(&stbl, &mut t, 1 << 30).unwrap();
         let c = t.cslg.expect("cslg should be parsed");
         assert_eq!(c.composition_to_dts_shift, 100);
         assert_eq!(c.least_decode_to_display_delta, -100);
@@ -17339,7 +17423,7 @@ mod tests {
         minf.extend(wrap_box_full_size(b"hmhd", &hmhd));
 
         let mut t = fresh_track();
-        super::parse_minf(&minf, &mut t).unwrap();
+        super::parse_minf(&minf, &mut t, 1 << 30).unwrap();
         let h = t.hmhd.expect("hmhd should be parsed");
         assert_eq!(h.max_pdu_size, 1400);
         assert_eq!(h.avg_pdu_size, 700);
@@ -17364,7 +17448,7 @@ mod tests {
         minf.extend(wrap_box_full_size(b"hmhd", &second));
 
         let mut t = fresh_track();
-        super::parse_minf(&minf, &mut t).unwrap();
+        super::parse_minf(&minf, &mut t, 1 << 30).unwrap();
         let h = t.hmhd.expect("hmhd should be parsed");
         assert_eq!(h.max_pdu_size, 111);
     }
@@ -17382,7 +17466,7 @@ mod tests {
         minf.extend(wrap_box_full_size(b"vmhd", &vmhd));
 
         let mut t = fresh_track();
-        super::parse_minf(&minf, &mut t).unwrap();
+        super::parse_minf(&minf, &mut t, 1 << 30).unwrap();
         let v = t.vmhd.expect("vmhd should be parsed");
         assert_eq!(v.graphicsmode, 0);
         assert_eq!(v.opcolor, [10, 20, 30]);
@@ -17405,7 +17489,7 @@ mod tests {
         minf.extend(wrap_box_full_size(b"vmhd", &second));
 
         let mut t = fresh_track();
-        super::parse_minf(&minf, &mut t).unwrap();
+        super::parse_minf(&minf, &mut t, 1 << 30).unwrap();
         assert_eq!(t.vmhd.unwrap().graphicsmode, 1);
     }
 
@@ -17419,7 +17503,7 @@ mod tests {
         minf.extend(wrap_box_full_size(b"vmhd", &short));
 
         let mut t = fresh_track();
-        super::parse_minf(&minf, &mut t).unwrap();
+        super::parse_minf(&minf, &mut t, 1 << 30).unwrap();
         assert!(t.vmhd.is_none());
     }
 
@@ -17937,7 +18021,7 @@ mod tests {
         // `load` is a plain Box: its body is the 16 numeric bytes.
         trak.extend_from_slice(&super::build_load_settings_box(&ls));
 
-        let t = super::parse_trak(&trak).unwrap().unwrap();
+        let t = super::parse_trak(&trak, 1 << 30).unwrap().unwrap();
         assert_eq!(t.load_settings, Some(ls));
     }
 
@@ -19011,7 +19095,7 @@ mod tests {
         let dinf = wrap_box_full_size(b"dinf", &dref_box);
 
         let mut t = fresh_track();
-        super::parse_minf(&dinf, &mut t).unwrap();
+        super::parse_minf(&dinf, &mut t, 1 << 30).unwrap();
         let d = t.dref.expect("dref should be parsed");
         assert_eq!(d.entries.len(), 1);
         assert_eq!(d.entries[0].location.as_deref(), Some("http://h/v.mp4"));
@@ -19161,7 +19245,7 @@ mod tests {
         stbl.extend(wrap_box_full_size(b"stsh", &stsh));
 
         let mut t = fresh_track();
-        super::parse_stbl(&stbl, &mut t).unwrap();
+        super::parse_stbl(&stbl, &mut t, 1 << 30).unwrap();
         assert_eq!(t.stsh, vec![(5, 2)]);
     }
 
@@ -19785,7 +19869,7 @@ mod tests {
         stbl.extend(wrap_box_full_size(b"sgpd", &sgpd));
 
         let mut t = fresh_track();
-        super::parse_stbl(&stbl, &mut t).unwrap();
+        super::parse_stbl(&stbl, &mut t, 1 << 30).unwrap();
         assert_eq!(t.sbgp.len(), 1);
         assert_eq!(&t.sbgp[0].grouping_type, b"roll");
         assert_eq!(t.sbgp[0].entries, vec![(4, 1)]);
@@ -19941,7 +20025,7 @@ mod tests {
         stbl.extend(wrap_box_full_size(b"sdtp", &sdtp));
 
         let mut t = fresh_track();
-        super::parse_stbl(&stbl, &mut t).unwrap();
+        super::parse_stbl(&stbl, &mut t, 1 << 30).unwrap();
         assert_eq!(t.sdtp.len(), 2);
         assert_eq!(t.sdtp[0].sample_depends_on, 2);
         assert_eq!(t.sdtp[1].sample_is_depended_on, 2);
@@ -20071,7 +20155,7 @@ mod tests {
         stbl.extend(wrap_box_full_size(b"stdp", &stdp));
 
         let mut t = fresh_track();
-        super::parse_stbl(&stbl, &mut t).unwrap();
+        super::parse_stbl(&stbl, &mut t, 1 << 30).unwrap();
         assert_eq!(t.stdp, vec![0x0001u16, 0x0005]);
     }
 
@@ -20218,7 +20302,7 @@ mod tests {
         stbl.extend(wrap_box_full_size(b"padb", &padb));
 
         let mut t = fresh_track();
-        super::parse_stbl(&stbl, &mut t).unwrap();
+        super::parse_stbl(&stbl, &mut t, 1 << 30).unwrap();
         assert_eq!(t.padb, vec![4u8, 1]);
     }
 
@@ -21630,7 +21714,7 @@ mod tests {
         let mut stbl = Vec::new();
         stbl.extend(wrap_box_full_size(b"subs", &subs_body));
         let mut t = fresh_track();
-        super::parse_stbl(&stbl, &mut t).unwrap();
+        super::parse_stbl(&stbl, &mut t, 1 << 30).unwrap();
         assert_eq!(t.subs.len(), 1);
         assert_eq!(t.subs[0].entries[0].subsamples[0].subsample_size, 42);
     }
@@ -21646,7 +21730,7 @@ mod tests {
         stbl.extend(wrap_box_full_size(b"subs", &s1));
         stbl.extend(wrap_box_full_size(b"subs", &s2));
         let mut t = fresh_track();
-        super::parse_stbl(&stbl, &mut t).unwrap();
+        super::parse_stbl(&stbl, &mut t, 1 << 30).unwrap();
         assert_eq!(t.subs.len(), 2);
         assert_eq!(t.subs[0].flags, 0);
         assert_eq!(t.subs[1].flags, 1);
@@ -21963,7 +22047,7 @@ mod tests {
         stbl.extend(wrap_box_full_size(b"saio", &saio_body));
 
         let mut t = fresh_track();
-        super::parse_stbl(&stbl, &mut t).unwrap();
+        super::parse_stbl(&stbl, &mut t, 1 << 30).unwrap();
         assert_eq!(t.saiz.len(), 1);
         assert_eq!(t.saiz[0].default_sample_info_size, 8);
         assert_eq!(t.saiz[0].sample_count, 4);
@@ -22176,6 +22260,7 @@ mod tests {
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut (1 << 30),
         )
         .expect("moof walk succeeds");
 
@@ -22230,6 +22315,7 @@ mod tests {
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut (1 << 30),
         )
         .expect("moof walk succeeds");
 
@@ -22291,6 +22377,7 @@ mod tests {
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut (1 << 30),
         )
         .expect("moof walk succeeds");
 
@@ -22330,6 +22417,7 @@ mod tests {
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut (1 << 30),
         )
         .expect("walk succeeds despite bad pssh");
         assert!(moof_psshes.is_empty(), "malformed pssh dropped silently");
@@ -22397,6 +22485,7 @@ mod tests {
             &mut groups,
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut (1 << 30),
         )
         .expect("traf walk succeeds");
 
@@ -22453,10 +22542,76 @@ mod tests {
             &mut groups,
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut (1 << 30),
         )
         .expect("traf walk succeeds");
 
         assert!(groups.is_empty());
+    }
+
+    // ----- §7.1 aux-info run parser (resolve_sai_aux_info) ------------------
+
+    /// Two plain IV-only cells decode into IV entries with no
+    /// subsample maps and a cleared UseSubSampleEncryption flag.
+    #[test]
+    fn parse_aux_info_run_plain_ivs() {
+        let buf: Vec<u8> = (0..16).collect();
+        let senc = super::parse_aux_info_run(&buf, &[8, 8], 8).expect("parses");
+        assert_eq!(senc.flags, 0);
+        assert_eq!(senc.samples.len(), 2);
+        assert_eq!(
+            senc.samples[0].initialization_vector,
+            (0..8).collect::<Vec<u8>>()
+        );
+        assert_eq!(
+            senc.samples[1].initialization_vector,
+            (8..16).collect::<Vec<u8>>()
+        );
+        assert!(senc.samples[1].subsamples.is_empty());
+    }
+
+    /// A cell larger than the IV carries `u16 count` + 6-byte
+    /// subsample entries and sets the flag.
+    #[test]
+    fn parse_aux_info_run_subsample_cell() {
+        let mut buf = vec![0xAA; 8];
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        buf.extend_from_slice(&7u16.to_be_bytes());
+        buf.extend_from_slice(&9u32.to_be_bytes());
+        let senc = super::parse_aux_info_run(&buf, &[16], 8).expect("parses");
+        assert_eq!(senc.flags, 0x0000_0002);
+        assert_eq!(senc.samples[0].subsamples.len(), 1);
+        assert_eq!(senc.samples[0].subsamples[0].bytes_of_clear_data, 7);
+        assert_eq!(senc.samples[0].subsamples[0].bytes_of_protected_data, 9);
+    }
+
+    /// Hostile shapes: a cell whose declared size doesn't decompose
+    /// into IV + count + 6·n, a cell shorter than the IV, and sizes
+    /// overrunning the fetched buffer are all rejected whole (no
+    /// half-parsed table).
+    #[test]
+    fn parse_aux_info_run_rejects_malformed_cells() {
+        // 12 = IV(8) + count(2) + 2 stray bytes → not 6-per-entry.
+        assert!(super::parse_aux_info_run(&[0u8; 12], &[12], 8).is_none());
+        // Cell shorter than the declared IV width.
+        assert!(super::parse_aux_info_run(&[0u8; 4], &[4], 8).is_none());
+        // Sizes overrun the buffer.
+        assert!(super::parse_aux_info_run(&[0u8; 8], &[8, 8], 8).is_none());
+        // Declared subsample count overruns the cell.
+        let mut buf = vec![0u8; 8];
+        buf.extend_from_slice(&9u16.to_be_bytes()); // 9 entries, none present
+        assert!(super::parse_aux_info_run(&buf, &[10], 8).is_none());
+    }
+
+    /// Constant-IV tracks (IV size 0) may carry zero-size cells —
+    /// they decode into empty entries rather than failing.
+    #[test]
+    fn parse_aux_info_run_zero_size_cells() {
+        let senc = super::parse_aux_info_run(&[], &[0, 0], 0).expect("parses");
+        assert_eq!(senc.samples.len(), 2);
+        assert!(senc.samples[0].initialization_vector.is_empty());
+        assert!(senc.samples[0].subsamples.is_empty());
+        assert_eq!(senc.flags, 0);
     }
 
     // ----- §8.8.3.1 sample_flags typed accessor -----------------------------

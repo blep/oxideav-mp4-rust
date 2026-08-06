@@ -790,7 +790,29 @@ fn parse_senc_sample_table(
         body[cursor + 3],
     ]) as usize;
     let mut cursor = cursor + 4;
-    let mut samples: Vec<SencSample> = Vec::with_capacity(sample_count.min(body.len() / 8));
+    // Every declared entry must be backed by wire bytes: at least the
+    // IV, plus the 2-byte subsample count when the flag is set. The
+    // zero-width entry shape (IV size 0 without subsamples — §7.2.2
+    // with `Per_Sample_IV_Size = 0`, the constant-IV case whose aux
+    // info §7.1 says "should be omitted") is syntactically legal and
+    // accepted, but carries no wire backing at all, so its count is
+    // bounded by what any real track fragment could hold (§7.2.3 ties
+    // `sample_count` to the traf's sample count) — a forged 32-bit
+    // count must fail here rather than drive an unbacked multi-GiB
+    // entry materialisation.
+    let min_entry = iv_size + if use_subsamples { 2 } else { 0 };
+    let remaining = body.len().saturating_sub(cursor);
+    let backed = match remaining.checked_div(min_entry) {
+        // Zero-width entries: bounded by plausibility, not bytes.
+        None => sample_count <= (1 << 20),
+        Some(max_backed) => max_backed >= sample_count,
+    };
+    if !backed {
+        return Err(Error::invalid(
+            "MP4 senc: sample_count exceeds what the box bytes can back",
+        ));
+    }
+    let mut samples: Vec<SencSample> = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
         if body.len() < cursor + iv_size {
             return Err(Error::invalid("MP4 senc: truncated InitializationVector"));

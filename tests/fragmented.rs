@@ -1028,3 +1028,40 @@ fn hostile_trun_inside_empty_duration_traf_is_ignored() {
     let dts_seen: Vec<i64> = got.iter().map(|(d, _)| *d).collect();
     assert_eq!(dts_seen, vec![0, 1, 2, 3, 504, 505, 506]);
 }
+
+/// Hostile input: a defaults-only `trun` (no per-sample field flags,
+/// so zero wire bytes back each declared sample) claiming ~10^9
+/// samples in a tiny file. The §8.8.8.2 `sample_count` must clear the
+/// whole-file sample budget — one input byte per sample floor — so
+/// the open fails cleanly instead of attempting a multi-GiB
+/// `TrunSample`/`SampleRef` allocation. Replays the shape behind the
+/// pinned fuzz artefact `regression_trun_unbacked_sample_count.bin`.
+#[test]
+fn hostile_trun_unbacked_sample_count_rejected() {
+    let track_id = 1u32;
+    let timescale = 48_000u32;
+
+    // trun: FullBox(v0, flags = 0 — defaults-only) + huge sample_count.
+    let mut trun_body = vec![0u8; 4];
+    trun_body.extend_from_slice(&1_000_000_000u32.to_be_bytes());
+    let trun = boxed(b"trun", &trun_body);
+
+    let mut traf_body = Vec::new();
+    traf_body.extend_from_slice(&tfhd_default_base_is_moof(track_id, 1));
+    traf_body.extend_from_slice(&tfdt_v1(0));
+    traf_body.extend_from_slice(&trun);
+    let traf = boxed(b"traf", &traf_body);
+    let mut moof_body = Vec::new();
+    moof_body.extend_from_slice(&mfhd(1));
+    moof_body.extend_from_slice(&traf);
+    let moof = boxed(b"moof", &moof_body);
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp());
+    file.extend_from_slice(&moov_audio(timescale, track_id, 1));
+    file.extend_from_slice(&moof);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let res = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver);
+    assert!(res.is_err(), "unbacked sample_count must be rejected");
+}

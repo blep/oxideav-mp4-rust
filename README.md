@@ -1852,6 +1852,13 @@ nothing panics, aborts, or OOMs. Seed corpus + regression artefacts
 live at `fuzz/corpus/demux/`. The fuzz crate has its own `[workspace]`
 and a committed `Cargo.lock` for reproducibility.
 
+The target opens via `open_typed`, drains up to 256 packets, re-seeks,
+and re-walks the input through `resolve_sai_aux_info` (so the
+attacker-controlled `saiz`/`saio` seek + fetch + §7.1 cell-parse path
+is under fuzz too). The corpus includes muxer-produced fragmented
+seeds — a sealed-`mehd` file with an empty-time gap fragment, and a
+senc-stripped CENC file carrying the `saiz`/`saio` aux-info form.
+
 Pinned regressions worth calling out:
 
 * **Extended-size u64 overflow** — a `size=1 largesize=u64::MAX`
@@ -1862,6 +1869,22 @@ Pinned regressions worth calling out:
   and rejects the header before any caller computes a derived end
   byte. Replayed by `tests/largesize_overflow.rs` and two boundary
   unit tests in `src/boxes.rs`.
+* **Unbacked-count allocations** (five shapes, one campaign) — a
+  forged 32-bit count in a structure whose entries consume little or
+  no wire data used to drive multi-GiB allocations from sub-KiB
+  inputs: a defaults-only `trun` (zero bytes per declared sample), a
+  constant-size `stsz` (`sample_count × sample_size` beyond the file
+  size), a `next_packet` payload buffer for a sample size the input
+  cannot hold, a `tfra` entry-table reserve ahead of its validation,
+  and a zero-width-entry `senc` (IV size 0, no subsample flag). Every
+  materializing count is now backed: fragmented sample counts are
+  charged against a whole-file sample budget (no file can hold more
+  samples than it has bytes), constant-size `stsz` validates against
+  the file size, packet reads validate `offset + size` against the
+  input length, and the moov table parsers clamp their reservations
+  to what the box body can back. Each shape is pinned as a
+  `regression_*` corpus entry, with matching unit / integration
+  tests.
 
 ## License
 

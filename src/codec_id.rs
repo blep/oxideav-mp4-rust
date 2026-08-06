@@ -68,8 +68,8 @@ pub fn from_sample_entry(fourcc: &[u8; 4]) -> CodecId {
         // Subtitle / timed-text sample entries (ISO/IEC 14496-12 §12.5–6
         // and the 3GPP TS 26.245 `tx3g` registration).
         //
-        // - `tx3g`: 3GPP Timed Text (the de-facto MP4 subtitle, called
-        //   "movtext" in ffmpeg parlance). Surfaced as `mov_text` so
+        // - `tx3g`: 3GPP Timed Text (the de-facto MP4 subtitle, widely
+        //   aliased "movtext" in tooling). Surfaced as `mov_text` so
         //   downstream callers can disambiguate from raw 3GPP text.
         // - `text`: QuickTime plain text (.mov chapter / subtitle).
         // - `wvtt`: WebVTT (W3C TTML mapping, also used by HLS).
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn prores_fourccs_map_to_prores() {
-        // Lower-case (canonical Apple spelling, used by modern ffmpeg).
+        // Lower-case (the canonical Apple registration spelling).
         for fc in [b"apco", b"apcs", b"apcn", b"apch", b"ap4h", b"ap4x"] {
             assert_eq!(
                 from_sample_entry(fc),

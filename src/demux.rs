@@ -261,6 +261,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let mut traf_sample_groups: Vec<TrafSampleGroupRecord> = Vec::new();
     let mut piff_senc_records: Vec<PiffSencRecord> = Vec::new();
     let mut piff_moof_psshes: Vec<MoofPsshRecord> = Vec::new();
+    let mut empty_durations: Vec<EmptyDurationRecord> = Vec::new();
     // Per-moof earliest presentation time, captured while the samples
     // each fragment contributes are still contiguous (before the
     // global offset sort below). ISO/IEC 23009-1 §5.10.3.3 anchors a
@@ -285,6 +286,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             &mut traf_sample_groups,
             &mut piff_senc_records,
             &mut piff_moof_psshes,
+            &mut empty_durations,
         )?;
         let mut best: Option<(i64, u32)> = None;
         for s in &samples[before..] {
@@ -621,6 +623,21 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         ));
     }
 
+    // §8.8.7 duration-is-empty — one `frag_empty_duration_<n>` key per
+    // empty-time traf, in moof-walk order. Format: "track=<t> seq=<s>
+    // duration=<d>" (duration in the track's media timescale). The
+    // typed records remain accessible via
+    // `Mp4Demuxer::empty_duration_records()`.
+    for (n, r) in empty_durations.iter().enumerate() {
+        metadata.push((
+            format!("frag_empty_duration_{n}"),
+            format!(
+                "track={} seq={} duration={}",
+                r.track_idx, r.moof_sequence, r.duration,
+            ),
+        ));
+    }
+
     // ISO/IEC 23001-7 §8.1 — pssh boxes that live inside individual
     // `moof` boxes (§8.1.1 permits pssh in either `moov` or `moof`).
     // One `moof_pssh_<n>` key per MoofPsshRecord, in moof-walk order,
@@ -762,6 +779,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         moof_psshes,
         senc_records,
         sai_records,
+        empty_durations,
         traf_sample_groups,
         piff_psshes: parsed.piff_psshes,
         piff_moof_psshes,
@@ -9338,6 +9356,30 @@ pub struct PiffSencRecord {
     pub senc: PiffSencBox,
 }
 
+/// One §8.8.7 `duration-is-empty` track fragment (tfhd flag 0x010000)
+/// encountered during the moof walk. The traf contributed no samples;
+/// instead it inserted `duration` ticks of empty time (in the track's
+/// media timescale) into the track's decode timeline — §8.8.6.1's
+/// "empty inserts can be used in audio tracks doing silence
+/// suppression, for example". The demuxer advances the track's running
+/// decode time by `duration` (so a subsequent `tfdt`-less fragment
+/// lands after the gap) and records the gap here; surfaced flat as
+/// `frag_empty_duration_<n>` metadata and typed via
+/// [`Mp4Demuxer::empty_duration_records`].
+#[derive(Clone, Copy, Debug)]
+pub struct EmptyDurationRecord {
+    /// `track_idx` of the matching stream in the demuxer's
+    /// `streams()` list (0-based).
+    pub track_idx: u32,
+    /// `mfhd.sequence_number` of the containing `moof`.
+    pub moof_sequence: u32,
+    /// Length of the empty interval, in the track's media timescale —
+    /// the effective default sample duration (§8.8.7.1: "the duration
+    /// provided in either default-sample-duration, or by the
+    /// default-duration in the Track Extends Box").
+    pub duration: u32,
+}
+
 /// One per-fragment ISO/IEC 14496-12 §8.7.8 / §8.7.9 record. Each
 /// `traf` may carry zero or more `(saiz, saio)` pairs (keyed by
 /// `(aux_info_type, aux_info_type_parameter)`); the demuxer collects
@@ -9503,6 +9545,7 @@ fn parse_moof(
     traf_sample_groups: &mut Vec<TrafSampleGroupRecord>,
     piff_senc_records: &mut Vec<PiffSencRecord>,
     piff_moof_psshes: &mut Vec<MoofPsshRecord>,
+    empty_durations: &mut Vec<EmptyDurationRecord>,
 ) -> Result<()> {
     let mut cur = std::io::Cursor::new(&moof.body);
     let end = moof.body.len() as u64;
@@ -9545,6 +9588,7 @@ fn parse_moof(
                     sai_records,
                     traf_sample_groups,
                     piff_senc_records,
+                    empty_durations,
                 )?;
             }
             PSSH => {
@@ -9629,6 +9673,12 @@ const TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT: u32 = 0x000002;
 const TFHD_DEFAULT_SAMPLE_DURATION_PRESENT: u32 = 0x000008;
 const TFHD_DEFAULT_SAMPLE_SIZE_PRESENT: u32 = 0x000010;
 const TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT: u32 = 0x000020;
+/// `duration-is-empty` (§8.8.7.1, 0x010000): the traf adds "empty
+/// time" to the track — the effective default sample duration (tfhd
+/// override, else the trex default) names an interval for which there
+/// are no samples, and per §8.8.8.1 "If the duration-is-empty flag is
+/// set in the tf_flags, there are no track runs".
+const TFHD_DURATION_IS_EMPTY: u32 = 0x010000;
 // `default-base-is-moof` (0x020000) is implicit in our base resolution:
 // when no explicit `base_data_offset` is present we already use
 // `moof_start`, which matches both the 0x020000 semantic and the
@@ -9785,6 +9835,7 @@ fn parse_traf(
     sai_records: &mut Vec<SaiRecord>,
     traf_sample_groups: &mut Vec<TrafSampleGroupRecord>,
     piff_senc_records: &mut Vec<PiffSencRecord>,
+    empty_durations: &mut Vec<EmptyDurationRecord>,
 ) -> Result<()> {
     // First pass: read tfhd + tfdt before the trun(s) so each trun
     // has the full default context. Also pick up senc (ISO/IEC 23001-7
@@ -9902,6 +9953,32 @@ fn parse_traf(
 
     if !tfhd_seen {
         return Err(Error::invalid("MP4: traf missing tfhd"));
+    }
+
+    // §8.8.7.1 duration-is-empty (0x010000): this traf adds "empty
+    // time" — there are no samples for the interval (§8.8.6.1), whose
+    // length is the effective default sample duration (tfhd override,
+    // else trex). Per §8.8.8.1 "If the duration-is-empty flag is set
+    // in the tf_flags, there are no track runs" — so the trun walk is
+    // skipped entirely: honouring a trun a non-conforming producer
+    // left behind would both fabricate samples the flag says don't
+    // exist and double-count the interval. The track's running decode
+    // time advances by the empty duration (a tfdt in this traf, if
+    // present, re-anchors it first), so a subsequent tfdt-less
+    // fragment lands after the gap. Per-sample carriers (senc / saiz
+    // / saio / sample-group maps) are meaningless without samples and
+    // are not recorded for an empty traf.
+    if state.tfhd_flags & TFHD_DURATION_IS_EMPTY != 0 {
+        let start = state
+            .base_media_decode_time
+            .unwrap_or(next_dts[state.track_idx]);
+        empty_durations.push(EmptyDurationRecord {
+            track_idx: state.track_idx as u32,
+            moof_sequence,
+            duration: state.default_sample_duration,
+        });
+        next_dts[state.track_idx] = start.saturating_add(state.default_sample_duration as i64);
+        return Ok(());
     }
 
     let track = &tracks[state.track_idx];
@@ -12771,6 +12848,11 @@ pub struct Mp4Demuxer {
     /// files have no aux-info at all).
     #[allow(dead_code)]
     sai_records: Vec<SaiRecord>,
+    /// ISO/IEC 14496-12 §8.8.7 duration-is-empty records. One per
+    /// empty-time `traf` (tfhd flag 0x010000), in moof-walk order.
+    /// Empty for files without empty-time inserts (the common case).
+    #[allow(dead_code)]
+    empty_durations: Vec<EmptyDurationRecord>,
     /// ISO/IEC 14496-12 §8.9 per-fragment sample-group records. One per
     /// `traf` that carried at least one `sgpd` / `sbgp` / `csgp` box,
     /// keyed by `(track_idx, moof_sequence)`. Empty in non-fragmented
@@ -12983,6 +13065,20 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn sai_records(&self) -> &[SaiRecord] {
         &self.sai_records
+    }
+
+    /// ISO/IEC 14496-12 §8.8.7 — `duration-is-empty` records, one per
+    /// empty-time `traf` (tfhd flag 0x010000) in moof-walk order. Each
+    /// names the track, the containing fragment's
+    /// `mfhd.sequence_number`, and the length of the inserted empty
+    /// interval in the track's media timescale (§8.8.6.1 — e.g. audio
+    /// silence suppression). The demuxer has already advanced the
+    /// track's running decode timeline past each gap; the records let
+    /// a remuxer or validator reconstruct where the gaps were. Empty
+    /// for files without empty-time inserts. The flat metadata channel
+    /// carries the same information as `frag_empty_duration_<n>` keys.
+    pub fn empty_duration_records(&self) -> &[EmptyDurationRecord] {
+        &self.empty_durations
     }
 
     /// ISO/IEC 14496-12 §8.9 — per-fragment sample-group records, one
@@ -21873,6 +21969,7 @@ mod tests {
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut Vec::new(),
         )
         .expect("moof walk succeeds");
 
@@ -21923,6 +22020,7 @@ mod tests {
             &mut senc,
             &mut sai,
             &mut moof_psshes,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
@@ -21986,6 +22084,7 @@ mod tests {
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut Vec::new(),
         )
         .expect("moof walk succeeds");
 
@@ -22021,6 +22120,7 @@ mod tests {
             &mut senc,
             &mut sai,
             &mut moof_psshes,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
@@ -22090,6 +22190,7 @@ mod tests {
             &mut sai,
             &mut groups,
             &mut Vec::new(),
+            &mut Vec::new(),
         )
         .expect("traf walk succeeds");
 
@@ -22144,6 +22245,7 @@ mod tests {
             &mut senc,
             &mut sai,
             &mut groups,
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .expect("traf walk succeeds");

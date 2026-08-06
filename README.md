@@ -156,6 +156,25 @@ Sample-entry FourCCs resolve to these codec ids:
   total against their own running tally). Absent `mehd`, the key is
   not emitted and `duration_micros` falls back to `mvhd.duration` as
   before.
+- Empty-time track fragments (ISO/IEC 14496-12 §8.8.7, `tfhd`
+  `duration-is-empty` flag 0x010000): a `traf` may insert "empty time"
+  into a track instead of samples (§8.8.6.1 — e.g. audio silence
+  suppression). The empty interval's length is the effective default
+  sample duration (the `tfhd` override, else the `trex` default); the
+  demuxer advances the track's running decode time by it, so a
+  subsequent `tfdt`-less fragment lands after the gap (a `tfdt` inside
+  the empty traf re-anchors the gap's start first). Per §8.8.8.1 "If
+  the duration-is-empty flag is set in the tf_flags, there are no
+  track runs" — a trun a non-conforming producer left inside an
+  empty-duration traf is ignored rather than fabricating samples or
+  double-counting the interval. Each gap is surfaced through
+  `Demuxer::metadata()` as `frag_empty_duration_<n>` (`"track=<t>
+  seq=<s> duration=<d>"`, moof-walk order, duration in the track's
+  media timescale) and typed via
+  `Mp4Demuxer::empty_duration_records()` (a slice of
+  `demux::EmptyDurationRecord`), so a remuxer or validator can
+  reconstruct where the gaps were. Absent empty-time inserts, no keys
+  are emitted.
 - Edit lists (ISO/IEC 14496-12 §8.6.5–6, `edts`/`elst`): the full
   explicit timeline map is applied to packet timestamps. Each edit
   segment contributes a constant presentation delta — a leading empty

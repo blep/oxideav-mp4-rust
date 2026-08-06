@@ -821,3 +821,210 @@ fn traf_local_sgpd_and_csgp_surface_per_fragment() {
     }
     assert_eq!(n, 2, "two fragmented samples still served");
 }
+
+// --- §8.8.7 duration-is-empty (empty-time inserts) ------------------------
+
+/// `tfhd` with `duration-is-empty` (0x010000) +
+/// `default_sample_duration_present` (0x000008): the traf inserts
+/// `dur` ticks of empty time and carries no track runs (§8.8.8.1).
+fn tfhd_empty_duration(track_id: u32, dur: u32) -> Vec<u8> {
+    let flags: u32 = 0x010000 | 0x000008;
+    let mut body = Vec::new();
+    body.push(0); // version
+    body.extend_from_slice(&flags.to_be_bytes()[1..4]);
+    body.extend_from_slice(&track_id.to_be_bytes());
+    body.extend_from_slice(&dur.to_be_bytes());
+    boxed(b"tfhd", &body)
+}
+
+/// A `moof` whose single traf is a §8.8.7 empty-time insert. Optional
+/// `tfdt` re-anchors the gap's start; `hostile_trun_sizes` (normally
+/// empty) plants a spec-violating trun that a conforming reader must
+/// ignore ("If the duration-is-empty flag is set in the tf_flags,
+/// there are no track runs").
+fn moof_empty_duration(
+    seq: u32,
+    track_id: u32,
+    dur: u32,
+    tfdt: Option<u64>,
+    hostile_trun_sizes: &[u32],
+) -> Vec<u8> {
+    let mut traf_body = Vec::new();
+    traf_body.extend_from_slice(&tfhd_empty_duration(track_id, dur));
+    if let Some(bmdt) = tfdt {
+        traf_body.extend_from_slice(&tfdt_v1(bmdt));
+    }
+    if !hostile_trun_sizes.is_empty() {
+        traf_body.extend_from_slice(&trun_sized(0, hostile_trun_sizes));
+    }
+    let traf = boxed(b"traf", &traf_body);
+    let mut moof_body = Vec::new();
+    moof_body.extend_from_slice(&mfhd(seq));
+    moof_body.extend_from_slice(&traf);
+    boxed(b"moof", &moof_body)
+}
+
+/// Like `moof_mdat_pair` but without a `tfdt` — decode times continue
+/// from the track's running decode time, which is exactly what a
+/// preceding empty-duration traf must have advanced.
+fn moof_mdat_pair_no_tfdt(
+    seq: u32,
+    track_id: u32,
+    default_dur: u32,
+    payload_chunks: &[Vec<u8>],
+) -> Vec<u8> {
+    let sizes: Vec<u32> = payload_chunks.iter().map(|p| p.len() as u32).collect();
+    let build = |data_offset: i32| {
+        let mut traf_body = Vec::new();
+        traf_body.extend_from_slice(&tfhd_default_base_is_moof(track_id, default_dur));
+        traf_body.extend_from_slice(&trun_sized(data_offset, &sizes));
+        let traf = boxed(b"traf", &traf_body);
+        let mut moof_body = Vec::new();
+        moof_body.extend_from_slice(&mfhd(seq));
+        moof_body.extend_from_slice(&traf);
+        boxed(b"moof", &moof_body)
+    };
+    let moof_size = build(0).len() as i32;
+    let moof = build(moof_size + 8);
+    assert_eq!(moof.len() as i32, moof_size, "moof size shifted");
+    let mut mdat_body = Vec::new();
+    for p in payload_chunks {
+        mdat_body.extend_from_slice(p);
+    }
+    let mdat = boxed(b"mdat", &mdat_body);
+    let mut out = Vec::with_capacity(moof.len() + mdat.len());
+    out.extend_from_slice(&moof);
+    out.extend_from_slice(&mdat);
+    out
+}
+
+/// An empty-duration traf between two fragments advances the track's
+/// running decode time by its default sample duration, so a
+/// `tfdt`-less follow-up fragment lands *after* the gap (§8.8.6.1
+/// "empty inserts", §8.8.7.1 duration-is-empty). The gap is surfaced
+/// through the flat metadata channel and the typed accessor.
+#[test]
+fn empty_duration_traf_inserts_gap_before_tfdt_less_fragment() {
+    let track_id = 1u32;
+    let timescale = 48_000u32;
+    let default_dur = 1u32;
+
+    let frag1: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 4]).collect();
+    let frag3: Vec<Vec<u8>> = (0..3u8).map(|i| vec![0x40 + i; 4]).collect();
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp());
+    file.extend_from_slice(&moov_audio(timescale, track_id, default_dur));
+    file.extend_from_slice(&moof_mdat_pair(1, track_id, default_dur, 0, &frag1));
+    // seq 2: 500 ticks of empty time, no tfdt, no trun, no mdat.
+    file.extend_from_slice(&moof_empty_duration(2, track_id, 500, None, &[]));
+    file.extend_from_slice(&moof_mdat_pair_no_tfdt(3, track_id, default_dur, &frag3));
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let mut dmx = oxideav_mp4::demux::open_typed(rs, &oxideav_core::NullCodecResolver).unwrap();
+
+    // Typed records: one gap, on track 0, in fragment 2, 500 ticks.
+    let recs = dmx.empty_duration_records();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].track_idx, 0);
+    assert_eq!(recs[0].moof_sequence, 2);
+    assert_eq!(recs[0].duration, 500);
+
+    // Flat metadata mirror.
+    use oxideav_core::Demuxer as _;
+    let md = dmx.metadata().to_vec();
+    let val = md
+        .iter()
+        .find(|(k, _)| k == "frag_empty_duration_0")
+        .map(|(_, v)| v.clone())
+        .expect("frag_empty_duration_0 key");
+    assert_eq!(val, "track=0 seq=2 duration=500");
+
+    let mut dts_seen = Vec::new();
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => dts_seen.push(p.dts.unwrap_or(0)),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("demux error: {e}"),
+        }
+    }
+    // frag1: dts 0..=3; gap of 500; frag3 (tfdt-less): 504, 505, 506.
+    assert_eq!(dts_seen, vec![0, 1, 2, 3, 504, 505, 506]);
+}
+
+/// A `tfdt` inside an empty-duration traf re-anchors the gap's start:
+/// the running decode time becomes `tfdt + duration`, not
+/// `previous_end + duration`.
+#[test]
+fn empty_duration_traf_with_tfdt_re_anchors_the_gap() {
+    let track_id = 1u32;
+    let timescale = 48_000u32;
+    let default_dur = 1u32;
+
+    let frag1: Vec<Vec<u8>> = (0..2u8).map(|i| vec![i; 4]).collect();
+    let frag3: Vec<Vec<u8>> = (0..2u8).map(|i| vec![0x60 + i; 4]).collect();
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp());
+    file.extend_from_slice(&moov_audio(timescale, track_id, default_dur));
+    file.extend_from_slice(&moof_mdat_pair(1, track_id, default_dur, 0, &frag1));
+    // seq 2: tfdt jumps to 1000, then 250 ticks of empty time.
+    file.extend_from_slice(&moof_empty_duration(2, track_id, 250, Some(1000), &[]));
+    file.extend_from_slice(&moof_mdat_pair_no_tfdt(3, track_id, default_dur, &frag3));
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+
+    let mut dts_seen = Vec::new();
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => dts_seen.push(p.dts.unwrap_or(0)),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("demux error: {e}"),
+        }
+    }
+    assert_eq!(dts_seen, vec![0, 1, 1250, 1251]);
+}
+
+/// §8.8.8.1: "If the duration-is-empty flag is set in the tf_flags,
+/// there are no track runs." A hostile file that plants a trun inside
+/// an empty-duration traf anyway gets the trun ignored — no fabricated
+/// samples, and the gap is counted exactly once.
+#[test]
+fn hostile_trun_inside_empty_duration_traf_is_ignored() {
+    let track_id = 1u32;
+    let timescale = 48_000u32;
+    let default_dur = 1u32;
+
+    let frag1: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 4]).collect();
+    let frag3: Vec<Vec<u8>> = (0..3u8).map(|i| vec![0x40 + i; 4]).collect();
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp());
+    file.extend_from_slice(&moov_audio(timescale, track_id, default_dur));
+    file.extend_from_slice(&moof_mdat_pair(1, track_id, default_dur, 0, &frag1));
+    // seq 2: empty-time traf that ALSO (illegally) carries a trun
+    // naming two 4-byte samples, plus an mdat those would point into.
+    file.extend_from_slice(&moof_empty_duration(2, track_id, 500, None, &[4, 4]));
+    file.extend_from_slice(&boxed(b"mdat", &[0xEEu8; 8]));
+    file.extend_from_slice(&moof_mdat_pair_no_tfdt(3, track_id, default_dur, &frag3));
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let mut dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+
+    let mut got: Vec<(i64, Vec<u8>)> = Vec::new();
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => got.push((p.dts.unwrap_or(0), p.data)),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("demux error: {e}"),
+        }
+    }
+    assert_eq!(got.len(), 7, "hostile trun contributed no samples");
+    assert!(
+        got.iter().all(|(_, d)| d != &vec![0xEE; 4]),
+        "no packet served from the empty traf's mdat"
+    );
+    let dts_seen: Vec<i64> = got.iter().map(|(d, _)| *d).collect();
+    assert_eq!(dts_seen, vec![0, 1, 2, 3, 504, 505, 506]);
+}

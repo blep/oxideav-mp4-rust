@@ -52,6 +52,13 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // via sidx / tfra), surfaced for partial-subsegment fetch tooling.
     let mut ssixes: Vec<SsixRecord> = Vec::new();
     let mut tfras: Vec<TfraRecord> = Vec::new();
+    // §8.8.12 — the `mfro` trailer's declared size of the enclosing
+    // `mfra`, plus that mfra's actual on-disk size, captured so the
+    // pair can be surfaced for validators (a player locates the mfra
+    // by reading the last 16 bytes of the file; a wrong `mfro.size`
+    // silently breaks that shortcut).
+    let mut mfro_size: Option<u32> = None;
+    let mut mfra_actual_size: Option<u64> = None;
     let mut prfts: Vec<PrftRecord> = Vec::new();
     // §8.1.3 — optional `pdin` ProgressiveDownloadInfoBox. Quantity is
     // zero or one per file (§8.1.3.1); we keep the first instance seen
@@ -165,7 +172,8 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             // seek-table consumed by `seek_to`.
             MFRA => {
                 let body = read_box_body(&mut *input, &hdr)?;
-                parse_mfra(&body, &mut tfras)?;
+                mfra_actual_size = Some(hdr.header_len + body.len() as u64);
+                parse_mfra(&body, &mut tfras, &mut mfro_size)?;
             }
             // ISO/IEC 23009-1 §5.10.3.3 — `emsg` DASH Event Message
             // Box. Top-level, zero or more before the first `moof` of
@@ -595,6 +603,23 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             format!("ssix_{n}"),
             format!("{} {}", s.subsegments.len(), total_ranges),
         ));
+    }
+
+    // §8.8.12 — surface the mfro-declared mfra size (and, when it
+    // disagrees with the mfra box actually measured on disk, the
+    // mismatch) so a validator or last-16-bytes locator can trust or
+    // flag the trailer without re-walking the file. Absent mfro, no
+    // keys are emitted.
+    if let Some(declared) = mfro_size {
+        metadata.push(("mfro_size".to_string(), declared.to_string()));
+        if let Some(actual) = mfra_actual_size {
+            if declared as u64 != actual {
+                metadata.push((
+                    "mfro_size_mismatch".to_string(),
+                    format!("declared={declared} actual={actual}"),
+                ));
+            }
+        }
     }
 
     // Surface ISO/IEC 23001-7 §8.1 pssh boxes as `pssh_<n>` keys with
@@ -11185,7 +11210,7 @@ fn parse_prft(body: &[u8]) -> Result<Option<PrftRecord>> {
 /// `tfra` per track-with-random-access plus the size-of-mfra `mfro`
 /// trailer. We collect the tfra entries; mfro is not consumed (we
 /// already know the mfra size from the box header).
-fn parse_mfra(body: &[u8], out: &mut Vec<TfraRecord>) -> Result<()> {
+fn parse_mfra(body: &[u8], out: &mut Vec<TfraRecord>, mfro_size: &mut Option<u32>) -> Result<()> {
     let mut cur = std::io::Cursor::new(body);
     let end = body.len() as u64;
     while cur.position() < end {
@@ -11202,9 +11227,16 @@ fn parse_mfra(body: &[u8], out: &mut Vec<TfraRecord>) -> Result<()> {
                 }
             }
             MFRO => {
-                // mfro: FullBox + size (u32). We've already read the
-                // outer mfra box header so the size is redundant here.
-                skip_cursor_bytes(&mut cur, psz);
+                // §8.8.12 — mfro: FullBox (4 bytes) + `size` (u32),
+                // the size of the enclosing `mfra` box. Redundant for
+                // this parse (the mfra header already told us), but a
+                // player locating the mfra from the last 16 bytes of
+                // the file depends on it being right — capture the
+                // declared value so it can be surfaced and checked.
+                let b = read_bytes_vec(&mut cur, psz)?;
+                if b.len() >= 8 && mfro_size.is_none() {
+                    *mfro_size = Some(u32::from_be_bytes([b[4], b[5], b[6], b[7]]));
+                }
             }
             _ => skip_cursor_bytes(&mut cur, psz),
         }
@@ -13883,7 +13915,7 @@ pub fn build_ssix_box(record: &SsixRecord) -> Result<Vec<u8>> {
 /// file's mfra indexes).
 pub fn parse_mfra_box(body: &[u8]) -> Result<Vec<TfraRecord>> {
     let mut out = Vec::new();
-    parse_mfra(body, &mut out)?;
+    parse_mfra(body, &mut out, &mut None)?;
     Ok(out)
 }
 

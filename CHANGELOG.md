@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mfro` surfacing (ISO/IEC 14496-12 §8.8.12): the trailer's declared enclosing-`mfra` size appears as the `mfro_size` metadata key, with a `mfro_size_mismatch` key (`declared=<d> actual=<a>`) when it disagrees with the mfra measured on disk — validating the last-16-bytes locator shortcut without affecting the open or the seek table. Integration test covers own-muxer match + byte-corrupted mismatch
+
 - Hostile-input hardening from a corpus-refreshed fuzz campaign — five distinct unbacked-allocation (OOM) shapes found and fixed, each pinned as a fuzz-corpus regression + covered by tests: (1) a defaults-only `trun` (zero wire bytes per sample) claiming ~10^9 samples — every fragmented `sample_count` is now charged against a whole-file sample budget (one input byte per sample floor); (2) constant-size `stsz` whose `sample_count × sample_size` exceeds the file size; (3) `next_packet` allocating a forged multi-GiB sample size before reading — sizes are validated against the input length first; (4) `tfra` reserving its entry table before the entry-count/body validation; (5) `senc` zero-width entries (IV size 0, no subsample flag — syntactically legal §7.2.2) with a forged count — bounded at 2^20 entries; plus body-backed `Vec::with_capacity` clamps across the moov table parsers (`stts` / `stsc` / `stsz` / `stz2` / `stss` / `ctts` / `stco` / `co64` / `elst`) and a pre-allocation cap on the `resolve_sai_aux_info` sizes scratch vector. Fuzz target now drives `open_typed` + `resolve_sai_aux_info` + `empty_duration_records`; corpus gains muxer-produced fMP4 seeds (sealed `mehd` + empty-time gap fragment, senc-stripped CENC saiz/saio carriage)
 
 ### Changed

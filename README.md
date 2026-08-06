@@ -156,6 +156,15 @@ Sample-entry FourCCs resolve to these codec ids:
   total against their own running tally). Absent `mehd`, the key is
   not emitted and `duration_micros` falls back to `mvhd.duration` as
   before.
+- Random-access trailer size check (ISO/IEC 14496-12 §8.8.12,
+  `mfro`): the `mfra`'s MovieFragmentRandomAccessOffsetBox declares
+  the size of the enclosing `mfra` so a player can locate the trailer
+  from the last 16 bytes of the file. The declared value is surfaced
+  on `Demuxer::metadata()` as `mfro_size`, and when it disagrees with
+  the `mfra` box actually measured on disk a `mfro_size_mismatch` key
+  (`declared=<d> actual=<a>`) flags the broken shortcut — the open and
+  the `tfra` seek table are unaffected either way. Absent `mfro`, no
+  keys are emitted.
 - Empty-time track fragments (ISO/IEC 14496-12 §8.8.7, `tfhd`
   `duration-is-empty` flag 0x010000): a `traf` may insert "empty time"
   into a track instead of samples (§8.8.6.1 — e.g. audio silence

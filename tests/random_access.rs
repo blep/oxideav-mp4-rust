@@ -1025,3 +1025,105 @@ fn sidx_with_wrong_reference_id_is_ignored() {
     let landed = dmx.seek_to(0, 2500).unwrap();
     assert_eq!(landed, 2048);
 }
+
+/// §8.8.12 — the `mfro` trailer's declared size of the enclosing
+/// `mfra` is surfaced as the `mfro_size` metadata key; when it matches
+/// the mfra actually measured on disk (as it does for this crate's own
+/// muxer output) no mismatch key appears, and byte-corrupting the
+/// declared size surfaces `mfro_size_mismatch` without breaking the
+/// open or the tfra seek table.
+#[test]
+fn mfro_size_surfaced_and_mismatch_flagged() {
+    use oxideav_core::{
+        CodecId, CodecParameters, Packet, ReadSeek, SampleFormat, StreamInfo, TimeBase, WriteSeek,
+    };
+    use oxideav_mp4::muxer::open_with_options;
+    use oxideav_mp4::options::{BrandPreset, FragmentCadence, FragmentedOptions, Mp4MuxerOptions};
+    use std::io::Cursor;
+
+    let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
+    params.channels = Some(2);
+    params.sample_rate = Some(48_000);
+    params.sample_format = Some(SampleFormat::S16);
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 48_000),
+        duration: None,
+        start_time: Some(0),
+        params,
+    };
+    let opts = Mp4MuxerOptions {
+        brand: BrandPreset::Mp4,
+        faststart: false,
+        fragmented: Some(FragmentedOptions {
+            cadence: FragmentCadence::EveryNPackets(1),
+            styp: None,
+            emit_random_access_indexes: true, // native sidx + mfra + mfro
+            levels: Vec::new(),
+            emit_ssix: false,
+            ssix_levels: (1, 2),
+            treps: Vec::new(),
+            write_mehd: false,
+        }),
+        write_edit_list: true,
+        track_sample_groups: Vec::new(),
+        large_mdat: false,
+        ..Mp4MuxerOptions::default()
+    };
+    let path = std::env::temp_dir().join("oxideav-mp4-mfro-size.mp4");
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mux = open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
+        mux.write_header().unwrap();
+        for i in 0..3i64 {
+            let mut pkt = Packet::new(0, stream.time_base, vec![i as u8; 32]);
+            pkt.pts = Some(i * 1024);
+            pkt.dts = Some(i * 1024);
+            pkt.duration = Some(1024);
+            pkt.flags.keyframe = true;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+
+    // Ground truth: the mfra box's actual total size on disk.
+    let mfra_pos = bytes
+        .windows(4)
+        .position(|w| w == b"mfra")
+        .expect("mfra present");
+    let mfra_actual = u32::from_be_bytes(bytes[mfra_pos - 4..mfra_pos].try_into().unwrap());
+
+    // Clean file: mfro_size matches, no mismatch key.
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes.clone()));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let md = dmx.metadata();
+    let declared = md
+        .iter()
+        .find(|(k, _)| k == "mfro_size")
+        .map(|(_, v)| v.clone())
+        .expect("mfro_size key");
+    assert_eq!(declared, mfra_actual.to_string());
+    assert!(
+        md.iter().all(|(k, _)| k != "mfro_size_mismatch"),
+        "no mismatch on a well-formed trailer"
+    );
+
+    // Corrupt the mfro's declared size (last 4 bytes of the file).
+    let mut corrupted = bytes.clone();
+    let n = corrupted.len();
+    corrupted[n - 4..].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(corrupted));
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let md = dmx.metadata();
+    let mismatch = md
+        .iter()
+        .find(|(k, _)| k == "mfro_size_mismatch")
+        .map(|(_, v)| v.clone())
+        .expect("mismatch key on corrupted trailer");
+    assert_eq!(
+        mismatch,
+        format!("declared={} actual={}", 0xDEAD_BEEFu32, mfra_actual)
+    );
+}

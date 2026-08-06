@@ -1073,9 +1073,22 @@ Sample-entry FourCCs resolve to these codec ids:
   the parser also surfaces a per-`traf` summary as `frag_sai_<n>`
   through `Demuxer::metadata()` (`"track=<t> seq=<s> saiz=<n>
   saio=<m>"`), and the structured per-fragment records (with offsets
-  preserved as `tfhd.base_data_offset`-relative per §8.8.14) are
+  preserved as `tfhd.base_data_offset`-relative per §8.8.14, plus the
+  resolved `base_data_offset` itself on each `SaiRecord`) are
   reachable through the public `Mp4Demuxer::sai_records()` accessor on
-  the demuxer (downcast). Absent `saiz` / `saio`, no keys are emitted
+  the demuxer (downcast). For the `senc`-less CENC carriage — aux
+  info in the mdat located only by `saiz`+`saio` —
+  `Mp4Demuxer::resolve_sai_aux_info()` fetches each fragment's
+  contiguous run from the input, parses the per-sample cells (IV of
+  the track's `tenc` width, then `u16` subsample count + `(u16, u32)`
+  runs when the cell exceeds the IV; each cell must consume its
+  declared size exactly), and appends synthesised records to
+  `senc_records()` — so a decryption layer replaying `senc_records`
+  consumes both carriages identically. Conservative skips: fragments
+  that already have a `senc` (parsed boxes stay authoritative), tracks
+  without `tenc`, non-§10 explicit `aux_info_type`s, multi-offset
+  `saio` (the per-trun split), totals over 16 MiB, runs past EOF, and
+  cells that don't parse. Absent `saiz` / `saio`, no keys are emitted
   and `sai_records()` is empty. The typed records (`demux::SaizBox` /
   `SaioBox`) are public, with `demux::parse_saiz_box` / `parse_saio_box`
   decoders and byte-exact `demux::build_saiz_box` / `build_saio_box`
@@ -1795,10 +1808,10 @@ first that applies:
   `read_packet` still yields ciphertext payloads and the caller —
   the party holding the content key for the sample's KID — calls
   the driver per sample. Key acquisition (DRM license exchange
-  against the `pssh.SystemID` blob) is out of scope by design. The
-  mdat-resident auxiliary-information bytes that the `saio`
-  offsets name are not pre-fetched — a CENC consumer reading them
-  seeks the input itself using the surfaced offsets.
+  against the `pssh.SystemID` blob) is out of scope by design.
+  (The `senc`-less aux-info carriage is no longer a gap:
+  `Mp4Demuxer::resolve_sai_aux_info` fetches and bridges it — see
+  the `saiz`/`saio` bullet above.)
 - Automatic mid-stream codec re-dispatch on a sample-description
   switch. All `stsd` entries are parsed and surfaced (§8.5.2), and the
   per-packet `sample_description_index` is now resolved from the

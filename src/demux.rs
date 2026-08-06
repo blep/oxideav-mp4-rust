@@ -780,6 +780,11 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         senc_records,
         sai_records,
         empty_durations,
+        track_tenc_iv_sizes: parsed
+            .tracks
+            .iter()
+            .map(|t| t.tenc.as_ref().map(|x| x.default_per_sample_iv_size))
+            .collect(),
         traf_sample_groups,
         piff_psshes: parsed.piff_psshes,
         piff_moof_psshes,
@@ -9356,6 +9361,67 @@ pub struct PiffSencRecord {
     pub senc: PiffSencBox,
 }
 
+/// Parse one contiguous CENC auxiliary-information run (ISO/IEC
+/// 23001-7 §7.1 cells, one per sample) fetched via a `saiz`+`saio`
+/// pair. `sizes[i]` is sample `i`'s declared aux-info size; each cell
+/// is an `InitializationVector` of `iv_size` bytes, followed — iff the
+/// cell is larger than the IV — by a `u16` subsample count and that
+/// many `(u16 BytesOfClearData, u32 BytesOfProtectedData)` runs, and
+/// must consume its declared size exactly. A zero-size cell yields an
+/// empty entry (constant-IV sample with no subsample map). Returns
+/// `None` when any cell fails to parse — the caller then leaves the
+/// record unsynthesised rather than surfacing half a table.
+fn parse_aux_info_run(buf: &[u8], sizes: &[usize], iv_size: usize) -> Option<crate::cenc::SencBox> {
+    let mut cursor = 0usize;
+    let mut samples = Vec::with_capacity(sizes.len());
+    let mut any_subsamples = false;
+    for &size in sizes {
+        let cell = buf.get(cursor..cursor.checked_add(size)?)?;
+        cursor += size;
+        if size == 0 {
+            samples.push(crate::cenc::SencSample {
+                initialization_vector: Vec::new(),
+                subsamples: Vec::new(),
+            });
+            continue;
+        }
+        if size < iv_size {
+            return None;
+        }
+        let iv = cell[..iv_size].to_vec();
+        let mut subsamples = Vec::new();
+        if size > iv_size {
+            let rest = &cell[iv_size..];
+            if rest.len() < 2 {
+                return None;
+            }
+            let n = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+            // The cell must be exactly IV + count + n entries — a
+            // mismatch means these bytes are not §7.1 aux info.
+            if rest.len() != 2 + n * 6 {
+                return None;
+            }
+            subsamples.reserve_exact(n);
+            for k in 0..n {
+                let e = &rest[2 + k * 6..2 + k * 6 + 6];
+                subsamples.push(crate::cenc::SubsampleEntry {
+                    bytes_of_clear_data: u16::from_be_bytes([e[0], e[1]]),
+                    bytes_of_protected_data: u32::from_be_bytes([e[2], e[3], e[4], e[5]]),
+                });
+            }
+            any_subsamples = true;
+        }
+        samples.push(crate::cenc::SencSample {
+            initialization_vector: iv,
+            subsamples,
+        });
+    }
+    Some(crate::cenc::SencBox {
+        flags: if any_subsamples { 0x0000_0002 } else { 0 },
+        samples,
+    })
+}
+
 /// One §8.8.7 `duration-is-empty` track fragment (tfhd flag 0x010000)
 /// encountered during the moof walk. The traf contributed no samples;
 /// instead it inserted `duration` ticks of empty time (in the track's
@@ -9406,6 +9472,17 @@ pub struct SaiRecord {
     /// preserved verbatim for inspection.
     pub saiz: Vec<TrafSaiz>,
     pub saio: Vec<TrafSaio>,
+    /// The traf's effective base data offset — `tfhd.base_data_offset`
+    /// when explicit, else the position of the enclosing `moof`
+    /// (`default-base-is-moof` and the §8.8.7.1 first-traf fall-back
+    /// collapse to the same anchor here). §8.8.14: "In a track
+    /// fragment box, this value is relative to the base offset
+    /// established by the track fragment header box" — so
+    /// `base_data_offset + saio.offsets[n]` is the absolute file
+    /// position of the auxiliary information. Stored so a consumer
+    /// (or [`Mp4Demuxer::resolve_sai_aux_info`]) can resolve the
+    /// relative offsets without re-walking the moof.
+    pub base_data_offset: u64,
 }
 
 /// One `saiz` (SampleAuxiliaryInformationSizesBox) found in a `traf`.
@@ -10053,6 +10130,7 @@ fn parse_traf(
             moof_sequence,
             saiz: frag_saiz,
             saio: frag_saio,
+            base_data_offset: state.base_data_offset,
         });
     }
 
@@ -12853,6 +12931,12 @@ pub struct Mp4Demuxer {
     /// Empty for files without empty-time inserts (the common case).
     #[allow(dead_code)]
     empty_durations: Vec<EmptyDurationRecord>,
+    /// Per-track ISO/IEC 23001-7 §8.2 `tenc.default_Per_Sample_IV_Size`
+    /// (`None` for tracks without a `tenc`). Needed by
+    /// [`Mp4Demuxer::resolve_sai_aux_info`] to parse fetched §7.1
+    /// auxiliary-information bytes into per-sample IV / subsample
+    /// records.
+    track_tenc_iv_sizes: Vec<Option<u8>>,
     /// ISO/IEC 14496-12 §8.9 per-fragment sample-group records. One per
     /// `traf` that carried at least one `sgpd` / `sbgp` / `csgp` box,
     /// keyed by `(track_idx, moof_sequence)`. Empty in non-fragmented
@@ -13065,6 +13149,128 @@ impl Mp4Demuxer {
     #[allow(dead_code)]
     pub fn sai_records(&self) -> &[SaiRecord] {
         &self.sai_records
+    }
+
+    /// Fetch the mdat-resident CENC auxiliary information that this
+    /// file's per-fragment `saiz` / `saio` pairs (ISO/IEC 14496-12
+    /// §8.7.8–9, in-`traf` carriage per §8.8.14) point at, and bridge
+    /// it into the [`Self::senc_records`] surface.
+    ///
+    /// A CENC file may carry its per-sample IVs + subsample maps
+    /// either in a `senc` SampleEncryptionBox or as a sample
+    /// auxiliary-information stream the `saiz`+`saio` pair locates
+    /// (the two carriages are byte-compatible per sample: an
+    /// `InitializationVector` of the track's
+    /// `tenc.default_Per_Sample_IV_Size` bytes, then — when the
+    /// sample's declared aux-info size exceeds the IV width — a
+    /// `u16` subsample count followed by `(u16 clear, u32 protected)`
+    /// runs; this crate's own fragmented muxer writes `saio` offsets
+    /// that point straight at its `senc` entry table). For each
+    /// [`SaiRecord`] whose `(track, fragment)` has **no** parsed
+    /// `senc` (the `senc`-less carriage), this method resolves the
+    /// single `saio` offset against the traf's base data offset
+    /// (§8.8.14), reads the run from the input, parses it with the
+    /// track's `tenc` IV width, and appends a synthesised
+    /// [`SencRecord`] — after which a decryption layer replaying
+    /// `senc_records` consumes both carriages identically.
+    ///
+    /// Returns the number of records added. Conservative skips (no
+    /// error): fragments that already have a `senc`, tracks without a
+    /// `tenc`, `saiz`/`saio` pairs whose `aux_info_type` is present
+    /// but not a §10 scheme FourCC, multi-offset `saio` boxes (the
+    /// per-trun split — offsets one per track run), an aux-info total
+    /// over 16 MiB, and runs whose bytes don't parse as §7.1 cells
+    /// (each cell must consume its declared size exactly). I/O errors
+    /// reading a resolvable run abort with the error. The input
+    /// cursor is restored, so packet reading is unaffected; the flat
+    /// `senc_<n>` metadata (rendered at `open`) does not retroactively
+    /// gain keys for synthesised records.
+    pub fn resolve_sai_aux_info(&mut self) -> Result<usize> {
+        use std::io::SeekFrom;
+        let have_senc: Vec<(u32, u32)> = self
+            .senc_records
+            .iter()
+            .map(|r| (r.track_idx, r.moof_sequence))
+            .collect();
+        let saved_pos = self.input.stream_position()?;
+        let mut new_records: Vec<SencRecord> = Vec::new();
+        for r in &self.sai_records {
+            if have_senc.contains(&(r.track_idx, r.moof_sequence)) {
+                continue;
+            }
+            let Some(iv_size) = self
+                .track_tenc_iv_sizes
+                .get(r.track_idx as usize)
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            for sz in &r.saiz {
+                // §8.7.8.3: absent aux_info_type (flags & 1 clear)
+                // means the type implied by the sample entry's
+                // protection scheme; an explicit type must be a §10
+                // scheme FourCC to be CENC aux info.
+                let is_cenc_type = match &sz.aux_info_type {
+                    None => true,
+                    Some(t) => matches!(t, b"cenc" | b"cbc1" | b"cens" | b"cbcs"),
+                };
+                if !is_cenc_type {
+                    continue;
+                }
+                let Some(so) = r.saio.iter().find(|so| {
+                    so.aux_info_type == sz.aux_info_type
+                        && so.aux_info_type_parameter == sz.aux_info_type_parameter
+                }) else {
+                    continue;
+                };
+                // §8.7.9.3 in-traf: entry_count is 1 (contiguous, run
+                // order) or one per trun. Only the contiguous shape is
+                // resolvable without per-trun sample counts.
+                if so.offsets.len() != 1 {
+                    continue;
+                }
+                let count = sz.sample_count as usize;
+                let sizes: Vec<usize> = if sz.default_sample_info_size != 0 {
+                    vec![sz.default_sample_info_size as usize; count]
+                } else {
+                    if sz.per_sample.len() < count {
+                        continue;
+                    }
+                    sz.per_sample[..count].iter().map(|&b| b as usize).collect()
+                };
+                let total: usize = sizes.iter().sum();
+                // §7.1 empty-aux (constant-IV, no subsamples) carries
+                // nothing to fetch; a forged multi-hundred-MiB total is
+                // rejected before allocation (u8-wide cells legitimately
+                // cap at 255 bytes/sample).
+                if total == 0 || total > 16 * 1024 * 1024 {
+                    continue;
+                }
+                let Some(abs) = r.base_data_offset.checked_add(so.offsets[0]) else {
+                    continue;
+                };
+                self.input.seek(SeekFrom::Start(abs))?;
+                let mut buf = vec![0u8; total];
+                if self.input.read_exact(&mut buf).is_err() {
+                    // Truncated file: the run lies past EOF. Skip the
+                    // record rather than failing the whole resolve.
+                    continue;
+                }
+                if let Some(senc) = parse_aux_info_run(&buf, &sizes, iv_size as usize) {
+                    new_records.push(SencRecord {
+                        track_idx: r.track_idx,
+                        moof_sequence: r.moof_sequence,
+                        senc,
+                    });
+                    break; // one senc per (track, fragment)
+                }
+            }
+        }
+        self.input.seek(SeekFrom::Start(saved_pos))?;
+        let added = new_records.len();
+        self.senc_records.extend(new_records);
+        Ok(added)
     }
 
     /// ISO/IEC 14496-12 §8.8.7 — `duration-is-empty` records, one per

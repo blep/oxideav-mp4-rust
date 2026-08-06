@@ -184,6 +184,29 @@ pub struct FragmentedOptions {
     /// uniqueness is the caller's responsibility). Empty by default —
     /// most fragmented files don't declare track extension properties.
     pub treps: Vec<crate::demux::TrepRecord>,
+    /// Write a `mehd` (MovieExtendsHeaderBox, ISO/IEC 14496-12 §8.8.2)
+    /// as the first child of the init-segment `mvex`, sealing the
+    /// file's overall presentation duration at `write_trailer`.
+    ///
+    /// §8.8.2.3 defines `fragment_duration` as "the duration of the
+    /// longest track, including movie fragments" in the movie
+    /// timescale — a value only known once the last fragment is laid
+    /// down. The muxer therefore reserves a version-1 (64-bit) `mehd`
+    /// with `fragment_duration = 0` at `write_header` and patches the
+    /// eight duration bytes in place at `write_trailer` (the output is
+    /// `WriteSeek`, so the seek-back is always available). A sealed
+    /// file then demuxes with an authoritative `duration_micros` even
+    /// though its `mvhd.duration` is 0 (no moov-resident samples); the
+    /// demuxer surfaces the raw value as the `mehd_fragment_duration`
+    /// metadata key. If `write_trailer` is never reached (a truncated
+    /// live capture), the placeholder 0 is exactly the "value unknown"
+    /// posture readers already handle — §8.8.2.1 says the overall
+    /// duration must then be computed by examining each fragment.
+    ///
+    /// Default `false`: no `mehd` is written and the init segment is
+    /// byte-identical to before (the right choice for live/low-latency
+    /// output where the init segment ships before the stream ends).
+    pub write_mehd: bool,
 }
 
 impl Default for FragmentedOptions {
@@ -199,6 +222,7 @@ impl Default for FragmentedOptions {
             emit_ssix: false,
             ssix_levels: (1, 2),
             treps: Vec::new(),
+            write_mehd: false,
         }
     }
 }

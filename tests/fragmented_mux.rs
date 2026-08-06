@@ -77,6 +77,7 @@ fn fragmented_options(cadence: FragmentCadence) -> Mp4MuxerOptions {
             emit_ssix: false,
             ssix_levels: (1, 2),
             treps: Vec::new(),
+            write_mehd: false,
         }),
         write_edit_list: true,
         track_sample_groups: Vec::new(),
@@ -231,6 +232,7 @@ fn no_styp_when_disabled() {
                 emit_ssix: false,
                 ssix_levels: (1, 2),
                 treps: Vec::new(),
+                write_mehd: false,
             }),
             write_edit_list: true,
             track_sample_groups: Vec::new(),
@@ -517,6 +519,7 @@ fn no_sidx_no_mfra_when_disabled() {
                 emit_ssix: false,
                 ssix_levels: (1, 2),
                 treps: Vec::new(),
+                write_mehd: false,
             }),
             write_edit_list: true,
             track_sample_groups: Vec::new(),
@@ -678,4 +681,104 @@ fn every_keyframe_cadence_keeps_the_final_sample() {
     for (i, (g, p)) in got.iter().zip(&packets).enumerate() {
         assert_eq!(g, &p.data, "packet {i} byte-exact");
     }
+}
+
+/// `FragmentedOptions::write_mehd` reserves a version-1 `mehd`
+/// (MovieExtendsHeaderBox, ISO/IEC 14496-12 §8.8.2) as the first child
+/// of the init-segment `mvex` and seals it at `write_trailer` with the
+/// overall presentation duration — §8.8.2.3 "the duration of the
+/// longest track, including movie fragments", in the movie timescale.
+/// The sealed file then demuxes with an authoritative
+/// `duration_micros` even though `mvhd.duration` is 0.
+#[test]
+fn write_mehd_seals_overall_duration() {
+    let stream = pcm_stream();
+    // 6 × 1024 = 6144 media ticks @ 48 kHz → exactly 128 movie ticks
+    // (timescale 1000): 6144 · 1000 / 48000 = 128.
+    let packets = make_pcm_packets(6, 1024);
+
+    let path = std::env::temp_dir().join("oxideav-mp4-frag-mehd.mp4");
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut opts = fragmented_options(FragmentCadence::EveryNPackets(2));
+        if let Some(fo) = opts.fragmented.as_mut() {
+            fo.write_mehd = true;
+        }
+        let mut mux = open_with_options(ws, std::slice::from_ref(&stream), opts).unwrap();
+        mux.write_header().unwrap();
+        for p in &packets {
+            mux.write_packet(p).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+
+    // Byte level: exactly one mehd, version 1, first child of mvex,
+    // patched (non-placeholder) duration.
+    let mehd_hits: Vec<usize> = bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| w == b"mehd")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(mehd_hits.len(), 1, "exactly one mehd in the file");
+    let pos = mehd_hits[0]; // position of the fourcc
+    assert_eq!(
+        &bytes[pos - 4..pos],
+        &20u32.to_be_bytes(),
+        "v1 mehd box is 20 bytes"
+    );
+    assert_eq!(bytes[pos + 4], 1, "version 1 (64-bit duration)");
+    let dur = u64::from_be_bytes(bytes[pos + 8..pos + 16].try_into().unwrap());
+    assert_eq!(dur, 128, "sealed fragment_duration in movie timescale");
+    let mvex_pos = bytes
+        .windows(4)
+        .position(|w| w == b"mvex")
+        .expect("mvex present");
+    assert_eq!(pos, mvex_pos + 8, "mehd is the first child of mvex");
+
+    // Demux level: duration comes from the sealed mehd (mvhd is 0)
+    // and the raw value is surfaced on the metadata channel.
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&path).unwrap());
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    assert_eq!(
+        dmx.duration_micros(),
+        Some(128_000),
+        "128 movie ticks @ 1000 = 128 ms"
+    );
+    let raw = dmx
+        .metadata()
+        .iter()
+        .find(|(k, _)| k == "mehd_fragment_duration")
+        .map(|(_, v)| v.clone())
+        .expect("mehd_fragment_duration key");
+    assert_eq!(raw, "128");
+}
+
+/// Without `write_mehd` (the default) no `mehd` is emitted and the
+/// init segment stays byte-identical to the historical layout.
+#[test]
+fn no_mehd_by_default() {
+    let stream = pcm_stream();
+    let packets = make_pcm_packets(3, 1024);
+    let path = mux_to_tempfile(
+        "oxideav-mp4-frag-no-mehd.mp4",
+        &stream,
+        FragmentCadence::EveryNPackets(2),
+        &packets,
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        !bytes.windows(4).any(|w| w == b"mehd"),
+        "default output carries no mehd"
+    );
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&path).unwrap());
+    let dmx = oxideav_mp4::demux::open(rs, &oxideav_core::NullCodecResolver).unwrap();
+    assert!(
+        dmx.metadata()
+            .iter()
+            .all(|(k, _)| k != "mehd_fragment_duration"),
+        "no mehd key without the box"
+    );
 }

@@ -178,6 +178,7 @@ fn fragmented_options() -> Mp4MuxerOptions {
             emit_ssix: false,
             ssix_levels: (1, 2),
             treps: Vec::new(),
+            write_mehd: false,
         }),
         write_edit_list: false,
         track_sample_groups: Vec::new(),

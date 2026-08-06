@@ -1657,6 +1657,23 @@ writes no `trep` and keeps the init segment byte-identical to before.
 This is the write-side dual of the read-side `parse_trep_box` /
 `TrepRecord` (and `parse_assp_box` / `AsspRecord`).
 
+A `mehd` (MovieExtendsHeaderBox, ISO/IEC 14496-12 §8.8.2) is written as
+the first child of the init-segment `mvex` when
+`FragmentedOptions::write_mehd` is set: a version-1 (64-bit) box is
+reserved with `fragment_duration = 0` at `write_header` and the eight
+duration bytes are patched in place at `write_trailer` with the sealed
+§8.8.2.3 total — "the duration of the longest track, including movie
+fragments", each track's cumulative decode time rescaled media → movie
+timescale with ceiling division. A sealed file then demuxes with an
+authoritative `Demuxer::duration_micros` even though `mvhd.duration`
+is 0, and the raw value surfaces as the `mehd_fragment_duration`
+metadata key (the read side documented above). If the trailer is never
+reached (truncated live capture) the placeholder 0 is the §8.8.2.1
+"compute by examining each fragment" posture readers already handle.
+Default `false` — no `mehd`, init segment byte-identical to before
+(the right choice for live output where the init segment ships before
+the stream ends).
+
 An `ssix` (SubsegmentIndexBox, ISO/IEC 14496-12 §8.16.4) is emitted
 immediately after each per-fragment `sidx` when `FragmentedOptions::
 emit_ssix` is set (and `emit_random_access_indexes` is on, since the

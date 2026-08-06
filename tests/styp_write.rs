@@ -170,6 +170,7 @@ fn write_fragmented_segment_with_styp_overrides_one_segment() {
         emit_ssix: false,
         ssix_levels: (1, 2),
         treps: Vec::new(),
+        write_mehd: false,
     };
     let path = std::env::temp_dir().join("oxideav-mp4-r127-styp-override.mp4");
     {
@@ -254,6 +255,7 @@ fn write_fragmented_segment_with_styp_emits_styp_when_preset_is_none() {
         emit_ssix: false,
         ssix_levels: (1, 2),
         treps: Vec::new(),
+        write_mehd: false,
     };
     let (mut mux, path) =
         open_to_tempfile("oxideav-mp4-r127-styp-preset-none.mp4", opts, frag_opts);
@@ -310,6 +312,7 @@ fn write_fragmented_segment_with_styp_precedes_moof() {
         emit_ssix: false,
         ssix_levels: (1, 2),
         treps: Vec::new(),
+        write_mehd: false,
     };
     let (mut mux, path) =
         open_to_tempfile("oxideav-mp4-r127-styp-precedes-moof.mp4", opts, frag_opts);
@@ -372,6 +375,7 @@ fn write_fragmented_segment_with_styp_empty_compat_emits_sixteen_bytes() {
         emit_ssix: false,
         ssix_levels: (1, 2),
         treps: Vec::new(),
+        write_mehd: false,
     };
     let (mut mux, path) =
         open_to_tempfile("oxideav-mp4-r127-styp-empty-compat.mp4", opts, frag_opts);

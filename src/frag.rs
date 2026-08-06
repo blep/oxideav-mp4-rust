@@ -279,6 +279,7 @@ pub fn open_fragmented_typed(
         pending_prft: None,
         pending_moof_pssh: Vec::new(),
         pending_emsg: Vec::new(),
+        mehd_patch_pos: None,
     })
 }
 
@@ -323,6 +324,13 @@ pub struct FragmentedMuxer {
     /// on the next `flush_fragment`. Set via
     /// [`Self::set_next_segment_emsg`].
     pending_emsg: Vec<crate::emsg::EmsgBox>,
+    /// Absolute file position of the init-segment `mehd`
+    /// `fragment_duration` field (eight bytes, version-1 layout) when
+    /// [`FragmentedOptions::write_mehd`] reserved one at
+    /// `write_header`; `write_trailer` seeks back and patches the
+    /// sealed §8.8.2.3 duration in place. `None` when no `mehd` was
+    /// requested.
+    mehd_patch_pos: Option<u64>,
 }
 
 impl Muxer for FragmentedMuxer {
@@ -346,13 +354,18 @@ impl Muxer for FragmentedMuxer {
         // tables). trex defaults are zero until the first packet locks
         // them; this is legal — the per-sample fields in `trun` then
         // override the zeroes.
-        let moov = build_init_moov(
+        let (moov, mehd_off) = build_init_moov(
             &self.tracks,
             &self.options.track_edit_lists,
             &self.frag_options.levels,
             &self.frag_options.treps,
             &self.options.pssh,
+            self.frag_options.write_mehd,
         )?;
+        // §8.8.2 — remember where the reserved mehd fragment_duration
+        // bytes landed in the file (ftyp precedes the moov) so
+        // write_trailer can seal the overall presentation duration.
+        self.mehd_patch_pos = mehd_off.map(|o| ftyp.len() as u64 + o as u64);
         self.output.write_all(&moov)?;
 
         self.header_written = true;
@@ -387,6 +400,29 @@ impl Muxer for FragmentedMuxer {
             && self.tracks.iter().any(|t| !t.tfra_entries.is_empty())
         {
             self.write_mfra()?;
+        }
+        // §8.8.2 — seal the reserved init-segment `mehd`: patch its
+        // fragment_duration with "the duration of the longest track,
+        // including movie fragments" (§8.8.2.3), in the movie
+        // timescale. Each track's total media duration is its
+        // cumulative decode time (`next_bmdt` — sum of every emitted
+        // sample duration); rescale media → movie (1000, matching the
+        // init mvhd) with u128 intermediates and ceiling division so a
+        // sub-tick remainder never truncates the presentation.
+        if let Some(pos) = self.mehd_patch_pos {
+            let mut fragment_duration: u64 = 0;
+            for t in &self.tracks {
+                let ts = t.base.media_time_scale as u128;
+                if ts == 0 {
+                    continue;
+                }
+                let scaled = ((t.next_bmdt as u128) * 1000).div_ceil(ts);
+                fragment_duration = fragment_duration.max(scaled.min(u64::MAX as u128) as u64);
+            }
+            let end = self.output.stream_position()?;
+            self.output.seek(std::io::SeekFrom::Start(pos))?;
+            self.output.write_all(&fragment_duration.to_be_bytes())?;
+            self.output.seek(std::io::SeekFrom::Start(end))?;
         }
         self.output.flush()?;
         self.trailer_written = true;
@@ -1255,7 +1291,8 @@ fn build_init_moov(
     levels: &[crate::demux::LevaEntry],
     treps: &[crate::demux::TrepRecord],
     pssh: &[crate::cenc::PsshBox],
-) -> Result<Vec<u8>> {
+    write_mehd: bool,
+) -> Result<(Vec<u8>, Option<usize>)> {
     // Movie timescale: pick 1000 (matches the non-fragmented path).
     let movie_timescale: u32 = 1000;
 
@@ -1275,13 +1312,19 @@ fn build_init_moov(
             explicit_elst,
         )?);
     }
-    moov_body.extend_from_slice(&build_mvex(tracks, levels, treps)?);
+    let mvex_off_in_body = moov_body.len();
+    let (mvex, mehd_off_in_mvex) = build_mvex(tracks, levels, treps, write_mehd)?;
+    moov_body.extend_from_slice(&mvex);
     // ISO/IEC 23001-7 §8.1: moov-level pssh boxes, one per DRM system,
     // after the trak boxes + mvex.
     for record in pssh {
         moov_body.extend_from_slice(&crate::cenc::build_pssh_box(record)?);
     }
-    Ok(wrap_box(b"moov", &moov_body))
+    // Translate the mehd fragment_duration offset from mvex-relative
+    // to moov-box-relative: 8 bytes of moov header + everything ahead
+    // of the mvex within the moov body.
+    let mehd_off_in_moov = mehd_off_in_mvex.map(|o| 8 + mvex_off_in_body + o);
+    Ok((wrap_box(b"moov", &moov_body), mehd_off_in_moov))
 }
 
 fn build_trak_init(
@@ -1309,8 +1352,14 @@ fn build_trak_init(
 }
 
 /// `mvex` (§8.8.1) container holding `trex` per track + an optional
-/// `mehd` (movie-extends header) carrying overall fragment duration —
-/// we omit `mehd` since fragment durations are unknown at init time.
+/// `mehd` (movie-extends header, §8.8.2) carrying the overall
+/// fragment duration. When `write_mehd` is set, a version-1 `mehd`
+/// with a zero placeholder is written as the first child and the
+/// returned offset (of its eight `fragment_duration` bytes, relative
+/// to the start of the emitted `mvex` box) lets `write_trailer` patch
+/// the sealed duration in place; when unset no `mehd` is emitted
+/// (fragment durations are unknown at init time and 0 already means
+/// "compute by examining each fragment", §8.8.2.1).
 ///
 /// When `levels` is non-empty, a `leva` (LevelAssignmentBox, §8.8.13) is
 /// appended after the `trex` boxes to declare how the file is partitioned
@@ -1327,8 +1376,26 @@ fn build_mvex(
     tracks: &[FragTrackState],
     levels: &[crate::demux::LevaEntry],
     treps: &[crate::demux::TrepRecord],
-) -> Result<Vec<u8>> {
+    write_mehd: bool,
+) -> Result<(Vec<u8>, Option<usize>)> {
     let mut body = Vec::new();
+    // §8.8.2 — optional `mehd` MovieExtendsHeaderBox, written first
+    // (matching the spec's listing order for `mvex` children). The
+    // overall `fragment_duration` ("duration of the longest track,
+    // including movie fragments", §8.8.2.3) is unknown at init time,
+    // so a version-1 (64-bit) placeholder of 0 is reserved here and
+    // patched in place at `write_trailer`. The returned offset names
+    // the eight duration bytes within the emitted `mvex` box.
+    let mut mehd_field_off = None;
+    if write_mehd {
+        // mvex header (8) + mehd header (8) + FullBox v1/flags (4).
+        mehd_field_off = Some(8 + 8 + 4);
+        let mut mehd = Vec::with_capacity(12);
+        mehd.push(1); // version 1 — 64-bit fragment_duration
+        mehd.extend_from_slice(&[0u8; 3]); // flags
+        mehd.extend_from_slice(&0u64.to_be_bytes()); // placeholder
+        body.extend_from_slice(&wrap_box(b"mehd", &mehd));
+    }
     for t in tracks {
         body.extend_from_slice(&build_trex(
             t.track_id,
@@ -1346,7 +1413,7 @@ fn build_mvex(
     for trep in treps {
         body.extend_from_slice(&crate::demux::build_trep_box(trep)?);
     }
-    Ok(wrap_box(b"mvex", &body))
+    Ok((wrap_box(b"mvex", &body), mehd_field_off))
 }
 
 /// §8.8.3 `trex` — TrackExtendsBox.

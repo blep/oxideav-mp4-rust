@@ -883,6 +883,94 @@ impl FragmentedMuxer {
         self.pending_emsg.extend(events);
     }
 
+    /// Insert `duration` ticks of **empty time** (in the target track's
+    /// media timescale) into a track's decode timeline — ISO/IEC
+    /// 14496-12 §8.8.6.1: "It is possible to add 'empty time' to a
+    /// track using these structures, as well as adding samples. Empty
+    /// inserts can be used in audio tracks doing silence suppression,
+    /// for example."
+    ///
+    /// Any pending samples are flushed first (so the gap lands at the
+    /// point of the call in stream order), then one standalone gap
+    /// fragment is written: `moof(mfhd + traf)` where the `traf`
+    /// carries a `tfhd` with the §8.8.7.1 `duration-is-empty` flag
+    /// (0x010000) + `default-sample-duration-present` (0x000008,
+    /// naming the interval length) and a `tfdt` anchoring the gap's
+    /// start — and, per §8.8.8.1 ("If the duration-is-empty flag is
+    /// set in the tf_flags, there are no track runs"), no `trun` and
+    /// no `mdat`. The track's running decode time advances by
+    /// `duration`, so subsequent fragments' `tfdt` values land after
+    /// the gap. The gap fragment consumes a `mfhd.sequence_number`
+    /// but carries no `styp` / `sidx` / `tfra` entry — it is a
+    /// timeline artefact, not an addressable media segment.
+    ///
+    /// §8.8.7.1 makes it an error to combine empty-duration fragments
+    /// with edit lists in the Movie Box, so the call is rejected when
+    /// the muxer was opened with explicit `track_edit_lists`.
+    ///
+    /// The demux dual surfaces each gap as a
+    /// `frag_empty_duration_<n>` metadata key and via
+    /// `Mp4Demuxer::empty_duration_records`.
+    pub fn insert_empty_time(&mut self, stream_index: usize, duration: u32) -> Result<()> {
+        if !self.header_written {
+            return Err(Error::other(
+                "mp4 muxer: insert_empty_time before write_header",
+            ));
+        }
+        if self.trailer_written {
+            return Err(Error::other(
+                "mp4 muxer: insert_empty_time after write_trailer",
+            ));
+        }
+        if stream_index >= self.tracks.len() {
+            return Err(Error::invalid(format!(
+                "mp4 muxer: insert_empty_time stream_index {} out of range ({} streams)",
+                stream_index,
+                self.tracks.len()
+            )));
+        }
+        if !self.options.track_edit_lists.is_empty() {
+            // §8.8.7.1: "It is an error to make a presentation that has
+            // both edit lists in the Movie Box, and empty-duration
+            // fragments."
+            return Err(Error::invalid(
+                "mp4 muxer: §8.8.7.1 forbids combining empty-duration fragments \
+                 with edit lists in the Movie Box (track_edit_lists is set)",
+            ));
+        }
+        if duration == 0 {
+            // A zero-length gap is a no-op, not an error — mirrors the
+            // demux side where duration 0 advances nothing.
+            return Ok(());
+        }
+        // Flush pending samples so the gap sits at the call point in
+        // stream order (keep a trailing keyframe attached — same
+        // posture as the end-of-stream flush).
+        if self.tracks.iter().any(|t| !t.pending.is_empty()) {
+            self.flush_fragment_inner(false)?;
+        }
+        self.sequence_number += 1;
+        let seq = self.sequence_number;
+        let t = &self.tracks[stream_index];
+        // tfhd: FullBox(version 0, flags = duration-is-empty |
+        // default-sample-duration-present) + track_ID + default_sample_duration.
+        let tfhd_flags: u32 = 0x010000 | 0x000008;
+        let mut tfhd_body = Vec::with_capacity(12);
+        tfhd_body.push(0); // version
+        tfhd_body.extend_from_slice(&tfhd_flags.to_be_bytes()[1..4]);
+        tfhd_body.extend_from_slice(&t.track_id.to_be_bytes());
+        tfhd_body.extend_from_slice(&duration.to_be_bytes());
+        let mut traf_body = wrap_box(b"tfhd", &tfhd_body);
+        traf_body.extend_from_slice(&build_tfdt(t.next_bmdt));
+        let traf = wrap_box(b"traf", &traf_body);
+        let mut moof_body = build_mfhd(seq);
+        moof_body.extend_from_slice(&traf);
+        let moof = wrap_box(b"moof", &moof_body);
+        self.output.write_all(&moof)?;
+        self.tracks[stream_index].next_bmdt += duration as u64;
+        Ok(())
+    }
+
     /// Return true when the cadence policy says it's time to emit a
     /// fragment after the current packet.
     ///

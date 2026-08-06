@@ -782,3 +782,123 @@ fn no_mehd_by_default() {
         "no mehd key without the box"
     );
 }
+
+/// `FragmentedMuxer::insert_empty_time` (ISO/IEC 14496-12 §8.8.6.1
+/// "empty inserts" / §8.8.7.1 `duration-is-empty`) writes a standalone
+/// gap fragment — `moof(mfhd + traf(tfhd(0x010008) + tfdt))`, no trun,
+/// no mdat — and advances the track's decode timeline, so packets
+/// written after the call come back (through our own demuxer) with
+/// decode times after the gap and the gap itself surfaces as a
+/// `frag_empty_duration_<n>` record.
+#[test]
+fn insert_empty_time_round_trips_through_demux() {
+    use oxideav_core::Muxer as _;
+
+    let stream = pcm_stream();
+    // 4 packets, a 9600-tick (200 ms @ 48 kHz) gap, then 4 packets
+    // whose pts/dts continue after the gap (silence-suppression shape).
+    let before = make_pcm_packets(4, 1024);
+    let mut after = make_pcm_packets(4, 1024);
+    for p in &mut after {
+        let shift = 4 * 1024 + 9600;
+        p.pts = p.pts.map(|v| v + shift);
+        p.dts = p.dts.map(|v| v + shift);
+    }
+
+    let path = std::env::temp_dir().join("oxideav-mp4-frag-empty-time.mp4");
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let opts = fragmented_options(FragmentCadence::EveryNPackets(2));
+        let frag_opts = opts.fragmented.clone().unwrap();
+        let mut mux = oxideav_mp4::frag::open_fragmented_typed(
+            ws,
+            std::slice::from_ref(&stream),
+            opts,
+            frag_opts,
+        )
+        .unwrap();
+        mux.write_header().unwrap();
+        for p in &before {
+            mux.write_packet(p).unwrap();
+        }
+        mux.insert_empty_time(0, 9600).unwrap();
+        for p in &after {
+            mux.write_packet(p).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+
+    // Byte level: exactly one tfhd carries the duration-is-empty flag.
+    let empty_tfhds = bytes
+        .windows(8)
+        .filter(|w| &w[0..4] == b"tfhd" && w[4] == 0 && w[5..8] == [0x01, 0x00, 0x08])
+        .count();
+    assert_eq!(empty_tfhds, 1, "one duration-is-empty tfhd");
+
+    // Demux level: 8 packets, gap between the halves, gap record present.
+    let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&path).unwrap());
+    let mut dmx = oxideav_mp4::demux::open_typed(rs, &oxideav_core::NullCodecResolver).unwrap();
+    let recs = dmx.empty_duration_records();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].track_idx, 0);
+    assert_eq!(recs[0].duration, 9600);
+
+    use oxideav_core::Demuxer as _;
+    let mut got_dts = Vec::new();
+    let mut got_data_len = 0usize;
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => {
+                got_dts.push(p.dts.unwrap_or(0));
+                got_data_len += p.data.len();
+            }
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux error: {e}"),
+        }
+    }
+    let expected_dts: Vec<i64> = (0..4)
+        .map(|i| i * 1024)
+        .chain((0..4).map(|i| 4 * 1024 + 9600 + i * 1024))
+        .collect();
+    assert_eq!(got_dts, expected_dts, "decode times jump the gap");
+    assert_eq!(got_data_len, 8 * 1024 * 4, "all payload bytes round-trip");
+}
+
+/// §8.8.7.1: "It is an error to make a presentation that has both edit
+/// lists in the Movie Box, and empty-duration fragments." A muxer
+/// opened with explicit track edit lists rejects `insert_empty_time`.
+#[test]
+fn insert_empty_time_rejected_with_edit_lists() {
+    use oxideav_core::Muxer as _;
+
+    let stream = pcm_stream();
+    let path = std::env::temp_dir().join("oxideav-mp4-frag-empty-time-elst.mp4");
+    let f = std::fs::File::create(&path).unwrap();
+    let ws: Box<dyn WriteSeek> = Box::new(f);
+    let mut opts = fragmented_options(FragmentCadence::EveryNPackets(2));
+    opts.track_edit_lists = vec![oxideav_mp4::options::TrackEditList {
+        stream_index: 0,
+        entries: vec![oxideav_mp4::demux::EditListEntry {
+            segment_duration: 0,
+            media_time: 1024,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        }],
+    }];
+    let frag_opts = opts.fragmented.clone().unwrap();
+    let mut mux = oxideav_mp4::frag::open_fragmented_typed(
+        ws,
+        std::slice::from_ref(&stream),
+        opts,
+        frag_opts,
+    )
+    .unwrap();
+    mux.write_header().unwrap();
+    let err = mux.insert_empty_time(0, 100).unwrap_err();
+    assert!(
+        err.to_string().contains("8.8.7.1"),
+        "error names the spec rule: {err}"
+    );
+}

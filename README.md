@@ -1657,6 +1657,25 @@ writes no `trep` and keeps the init segment byte-identical to before.
 This is the write-side dual of the read-side `parse_trep_box` /
 `TrepRecord` (and `parse_assp_box` / `AsspRecord`).
 
+Empty time (ISO/IEC 14496-12 §8.8.6.1 "empty inserts" — e.g. audio
+silence suppression) is written via
+`FragmentedMuxer::insert_empty_time(stream_index, duration)`: pending
+samples are flushed, then one standalone gap fragment
+`moof(mfhd + traf(tfhd + tfdt))` is emitted whose `tfhd` carries the
+§8.8.7.1 `duration-is-empty` flag naming the interval (in the track's
+media timescale) — per §8.8.8.1 the traf has no `trun` and no `mdat`
+follows. The track's running decode time advances by the gap, so
+subsequent fragments' `tfdt` (and the next `sidx`'s earliest
+presentation time) land after it. The gap fragment consumes a
+`mfhd.sequence_number` but gets no `styp` / `sidx` / `tfra` entry (a
+timeline artefact, not an addressable segment). Per §8.8.7.1
+("It is an error to make a presentation that has both edit lists in
+the Movie Box, and empty-duration fragments") the call is rejected
+when the muxer was opened with explicit `track_edit_lists`. This is
+the write-side dual of the demuxer's `frag_empty_duration_<n>` /
+`empty_duration_records()` surface, and a mux → demux round-trip
+recovers the gap position and length exactly.
+
 A `mehd` (MovieExtendsHeaderBox, ISO/IEC 14496-12 §8.8.2) is written as
 the first child of the init-segment `mvex` when
 `FragmentedOptions::write_mehd` is set: a version-1 (64-bit) box is

@@ -1000,7 +1000,7 @@ pub struct TfraEntry {
 /// box that follows it in bitstream order (§8.16.5.1 placement rule),
 /// so a low-latency DASH/CMAF live consumer can match production
 /// wall-clock to media presentation time.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrftRecord {
     /// `track_ID` of the reference track whose `media_time` this box
     /// annotates (§8.16.5.3 reference_track_ID).
@@ -1263,7 +1263,7 @@ pub struct PdinEntry {
 ///
 /// Quantity is zero or one per file (§8.1.3.1); the demuxer collects
 /// the first instance and ignores any subsequent ones.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PdinRecord {
     /// Pairs in file order, mirroring §8.1.3.2's loop ordering.
     /// A consumer searching by rate should sort if a non-monotonic
@@ -1361,7 +1361,7 @@ pub struct LevaEntry {
 /// the first instance seen inside `mvex` and ignores any subsequent
 /// copies (a malformed file with two leva boxes is no reason to abort
 /// the parse — the first is the one the spec endorses).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LevaRecord {
     /// Entries in file order, mirroring §8.8.13.2's loop ordering.
     /// The §8.8.13.3 sequence rule on `assignment_type` ordering is
@@ -1446,7 +1446,7 @@ pub struct TrepChild {
 /// A `trep` with a malformed FullBox preamble or a truncated `track_id`
 /// is dropped rather than aborting the parse, matching the treatment of
 /// the sibling optional `mvex` boxes (`mehd`, `leva`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrepRecord {
     /// `track_id` (§8.8.15.3) — the track for which these extension
     /// properties are provided. Carried verbatim; track 0 is not a
@@ -2186,7 +2186,7 @@ pub struct SubSampleEntry {
 /// One entry of a `subs` (SubSampleInformationBox, §8.7.7) — a single
 /// sample's sub-sample table together with the sparse delta that
 /// addresses it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubsEntry {
     /// §8.7.7.3 — sample-number delta from the previous entry's sample
     /// (or from sample 0 for the first entry). The decoded absolute
@@ -2211,7 +2211,7 @@ pub struct SubsEntry {
 /// spec mandates that each carry a distinct `flags` value (§8.7.7.1).
 /// We preserve both as-recorded so codec-specific consumers can pick
 /// the table whose semantics they understand.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubsBox {
     /// FullBox version (0 or 1) — determines `subsample_size` width on
     /// disk. We normalise to `u32` in `SubSampleEntry::subsample_size`.
@@ -2245,7 +2245,7 @@ pub struct SubsBox {
 /// sample. `sample_count` is stored so an over-long table (the spec
 /// permits `sample_count` < total stsz/stz2 count — auxiliary info
 /// supplied for the initial samples only) is preserved verbatim.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SaizBox {
     /// §8.7.8.3 `aux_info_type` — present only when `flags & 1` is set.
     pub aux_info_type: Option<[u8; 4]>,
@@ -2281,7 +2281,7 @@ pub struct SaizBox {
 /// widened to `u64` so callers handle one shape. `version` is preserved
 /// so a producer round-tripping back to disk can re-emit the same
 /// width.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SaioBox {
     /// FullBox version (0 or 1) — selects 32-bit / 64-bit on-disk
     /// offset width. Preserved so a round-trip can match the original
@@ -7005,7 +7005,16 @@ pub fn build_tcmi_box(r: &TcmiBox) -> Vec<u8> {
         body.extend_from_slice(&c.to_be_bytes());
     }
     let name = r.font_name.as_bytes();
-    let n = name.len().min(255);
+    // The Pascal length byte caps the wire name at 255 bytes. A record
+    // name can legitimately exceed that (a wire name of up to 255
+    // non-UTF-8 bytes expands up to threefold under the parser's lossy
+    // replacement), so truncate — but only at a char boundary, so the
+    // emitted bytes are valid UTF-8 and reparse cleanly instead of
+    // growing a replacement-character tail.
+    let mut n = name.len().min(255);
+    while n > 0 && !r.font_name.is_char_boundary(n) {
+        n -= 1;
+    }
     body.push(n as u8);
     body.extend_from_slice(&name[..n]);
     wrap_box(&TCMI, &body)
@@ -7161,7 +7170,13 @@ pub fn build_text_sample_entry(r: &TextSampleEntry, data_reference_index: u16) -
         body.extend_from_slice(&c.to_be_bytes());
     }
     let name = r.text_name.as_bytes();
-    let n = name.len().min(255);
+    // Pascal length byte: cap at 255 wire bytes, truncating only at a
+    // char boundary (see `build_tcmi_box` — over-long names arise from
+    // the parser's lossy replacement of non-UTF-8 wire names).
+    let mut n = name.len().min(255);
+    while n > 0 && !r.text_name.is_char_boundary(n) {
+        n -= 1;
+    }
     body.push(n as u8);
     body.extend_from_slice(&name[..n]);
     wrap_box(b"text", &body)
@@ -17766,6 +17781,38 @@ mod tests {
         let boxed = super::build_tcmi_box(&tc);
         let back = super::parse_tcmi_box(&boxed[8..]).expect("round-trip parse");
         assert_eq!(back, tc);
+    }
+
+    /// Regression (r443 box_parsers fuzz): a `font_name` longer than the
+    /// 255-byte Pascal ceiling — which arises when the parser lossily
+    /// replaces non-UTF-8 wire bytes (each expands to a 3-byte U+FFFD) —
+    /// must truncate at a char boundary so the rebuilt box reparses
+    /// cleanly to a prefix, never a body whose declared length slices a
+    /// multi-byte char (which grew a replacement-character tail).
+    #[test]
+    fn build_tcmi_box_truncates_overlong_name_on_char_boundary() {
+        // 100 replacement chars = 300 bytes > 255; the 255-byte cut
+        // lands mid-char (each U+FFFD is 3 bytes; 255 = 85*3, a clean
+        // boundary — so use 86 chars * 3 = 258 and force an 85.33 cut).
+        let name: String = "\u{FFFD}".repeat(90);
+        let tc = super::TcmiBox {
+            text_font: 1,
+            text_face: 2,
+            text_size: 3,
+            text_color: [1, 2, 3],
+            background_color: [4, 5, 6],
+            font_name: name.clone(),
+        };
+        let boxed = super::build_tcmi_box(&tc);
+        let back = super::parse_tcmi_box(&boxed[8..]).expect("reparse after truncating build");
+        // Emitted name is a valid-UTF-8 prefix of the original, ≤ 255 B.
+        assert!(back.font_name.len() <= 255);
+        assert!(name.starts_with(&back.font_name));
+        assert_eq!(back.font_name.len() % 3, 0, "cut on a U+FFFD boundary");
+        // Idempotent: rebuilding the (now representable) record is exact.
+        let boxed2 = super::build_tcmi_box(&back);
+        let back2 = super::parse_tcmi_box(&boxed2[8..]).unwrap();
+        assert_eq!(back2, back);
     }
 
     /// A `tcmi` body shorter than the fixed 22-byte prefix is rejected;

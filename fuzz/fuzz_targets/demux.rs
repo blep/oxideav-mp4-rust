@@ -45,59 +45,14 @@
 //! We cap the per-input packet count so a pathological valid stream
 //! can't dominate fuzz time.
 
-use std::io::Cursor;
-
 use libfuzzer_sys::fuzz_target;
-use oxideav_core::{Demuxer as _, NullCodecResolver, ReadSeek};
-
-/// Bound on how many packets we drain per fuzz input. A pathological
-/// but legitimate stream (e.g. a one-sample-per-chunk track with a
-/// long `stsz` table) could otherwise spin the fuzzer on a single
-/// many-packet track instead of exploring the input space.
-const MAX_PACKETS_PER_INPUT: usize = 256;
+use oxideav_mp4_fuzz::exercise_demux;
 
 fuzz_target!(|data: &[u8]| {
-    // Skip trivially-short inputs — the smallest legal MP4 has at
-    // least an 8-byte `ftyp` box header, so anything shorter can't
-    // even pass the outermost box read.
-    if data.len() < 8 {
-        return;
-    }
-    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(data.to_vec()));
-    let Ok(mut dmx) = oxideav_mp4::demux::open_typed(rs, &NullCodecResolver) else {
-        return;
-    };
-
-    // Touch the metadata + streams slices once. These are populated
-    // entirely by the open() path but exercising the accessors
-    // catches any post-open invariant the parser might have left in
-    // an inconsistent state.
-    let _ = dmx.streams().len();
-    let _ = dmx.metadata().len();
-    let _ = dmx.duration_micros();
-    let _ = dmx.empty_duration_records().len();
-
-    // Re-walk the input for the senc-less CENC aux-info carriage:
-    // attacker-controlled `saiz` sizes + `saio` offsets drive seeks,
-    // a bounded (≤ 16 MiB, input-backed) allocation, and the §7.1
-    // per-sample cell parser. Both Ok(n) and Err(_) are fine; what
-    // may not happen is a panic or an unbounded allocation.
-    let _ = dmx.resolve_sai_aux_info();
-
-    // Drain packets up to MAX_PACKETS_PER_INPUT. The loop terminates
-    // on the first error (Eof, invalid, ...) — fuzz inputs are
-    // expected to crash the sample-table walker more often than they
-    // demux cleanly, so a bounded loop is plenty.
-    for _ in 0..MAX_PACKETS_PER_INPUT {
-        if dmx.next_packet().is_err() {
-            break;
-        }
-    }
-
-    // Re-exercise the seek path. seek_to(0, 0) is the cheapest
-    // possible call — it lands on the first sync sample of stream 0
-    // (if any) — and runs the `stss` / sample-offset machinery from
-    // a random offset. If the file had no streams this returns Err;
-    // that's fine.
-    let _ = dmx.seek_to(0, 0);
+    // The shared battery: typed open front, every public accessor
+    // (CENC / PIFF / emsg / HEIF item catalogue / edit lists /
+    // fragment records / saiz-saio aux-info resolution), a bounded
+    // packet drain, and both seek paths. See
+    // `oxideav_mp4_fuzz::exercise_demux` for the full walk.
+    exercise_demux(data);
 });

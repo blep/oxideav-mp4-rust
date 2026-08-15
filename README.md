@@ -1848,27 +1848,77 @@ Registers:
 
 ## Fuzzing
 
-A `cargo-fuzz` target exercises the BMFF box-tree walker on
-arbitrary bytes:
+Six `cargo-fuzz` targets exercise the BMFF surface, sharing an
+`oxideav_mp4_fuzz` library (a `Recipe` byte-reader, a
+valid-by-construction `MuxPlan`, and a full-accessor demux battery):
 
 ```sh
 cd fuzz
-cargo +nightly fuzz run demux
+cargo +nightly fuzz run demux            # arbitrary bytes → open-or-error
+cargo +nightly fuzz run box_parsers      # every standalone box parser
+cargo +nightly fuzz run mux_roundtrip    # mux → demux byte-exact identity
+cargo +nightly fuzz run structured_mutate # corrupt writer-shaped fixtures
+cargo +nightly fuzz run meta_graph       # HEIF item graphs
+cargo +nightly fuzz run cenc_roundtrip   # encrypt∘decrypt identity
 ```
 
-The target opens, drains up to 256 packets, and re-seeks; it asserts
-nothing panics, aborts, or OOMs. Seed corpus + regression artefacts
-live at `fuzz/corpus/demux/`. The fuzz crate has its own `[workspace]`
-and a committed `Cargo.lock` for reproducibility.
+- **`demux`** — arbitrary bytes through `open_typed`, then the whole
+  public accessor set (CENC / PIFF / `emsg` / HEIF item resolution /
+  edit lists / fragment records / `resolve_sai_aux_info` so the
+  attacker-controlled `saiz`/`saio` seek + §7.1 cell-parse path is
+  covered), a 256-packet drain, and both seek paths. Asserts
+  open-or-error, never a panic / abort / OOM.
+- **`box_parsers`** — hostile bytes through every standalone public
+  box parser, asserting a **parse∘build fixed-point** wherever the
+  byte-exact builder dual exists (parser and builder must agree on the
+  wire format, not merely not-crash).
+- **`mux_roundtrip`** — valid-by-construction recipes must mux and
+  re-demux byte-exactly (payloads + pts) across plain / faststart /
+  fragmented (incl. `styp` + `sidx`/`mfra`) layouts, with pts identity
+  held exact through the media↔movie timescale rescale and a
+  start-delay `elst`.
+- **`structured_mutate`** — writer-shaped fixtures with fuzz-directed
+  byte flips, truncations, and targeted overwrites right after the
+  sample-table / fragment / index FourCCs the offset walkers
+  arithmetic on.
+- **`meta_graph`** — builder-assembled `iloc`/`iinf`/`iref`/`ipma`
+  catalogues (every construction method, reference cycles, out-of-range
+  property indexes) reparse identically, then survive hostile mutation
+  of the `meta` body.
+- **`cenc_roundtrip`** — encrypt∘decrypt identity under
+  arbitrary-but-valid §10 scheme × `tenc` × subsample-partition
+  metadata, plus hostile `plan_sample_cipher` / `senc` / `seig` walks.
 
-The target opens via `open_typed`, drains up to 256 packets, re-seeks,
-and re-walks the input through `resolve_sai_aux_info` (so the
-attacker-controlled `saiz`/`saio` seek + fetch + §7.1 cell-parse path
-is under fuzz too). The corpus includes muxer-produced fragmented
-seeds — a sealed-`mehd` file with an empty-time gap fragment, and a
-senc-stripped CENC file carrying the `saiz`/`saio` aux-info form.
+Each target asserts nothing panics, aborts, or OOMs (round-trip
+targets additionally assert their identity contract). Seed corpus +
+regression artefacts live under `fuzz/corpus/<target>/`. The fuzz
+crate has its own `[workspace]` and a committed `Cargo.lock` for
+reproducibility; a daily `Fuzz` workflow runs the whole battery. The
+corpus includes muxer-produced fragmented seeds — a sealed-`mehd` file
+with an empty-time gap fragment, and a senc-stripped CENC file
+carrying the `saiz`/`saio` aux-info form.
 
 Pinned regressions worth calling out:
+
+* **`tcmi` / `text` Pascal-string round-trip** (§12) — a `font_name`
+  longer than the 255-byte Pascal ceiling (the lossy U+FFFD expansion
+  of non-UTF-8 wire bytes triples the byte length) was truncated at a
+  raw byte index, slicing a multi-byte char and growing a
+  replacement-character tail on reparse. The builders now truncate on
+  a char boundary. Pinned as `regression_tcmi_overlong_lossy_name.bin`.
+* **`fd` / `hint` child-walker overflow** (§4.2) — a hostile
+  `largesize` near `u64::MAX` (or an oversize `size32`) overflowed the
+  `pos + total` bound check before it could reject the child. Both
+  walkers now bound with `checked_add`. Pinned as
+  `regression_fd_largesize_overflow.bin`.
+* **Extended-size u64 overflow** — a `size=1 largesize=u64::MAX`
+  extended box anchored at a non-zero file offset used to overflow
+  every downstream `body_start + payload_size` arithmetic site
+  (the §8.16.3 `sidx` end-anchor computation is the most exposed
+  example). `read_box_header` now `checked_add`s `start + total_size`
+  and rejects the header before any caller computes a derived end
+  byte. Replayed by `tests/largesize_overflow.rs` and two boundary
+  unit tests in `src/boxes.rs`.
 
 * **Extended-size u64 overflow** — a `size=1 largesize=u64::MAX`
   extended box anchored at a non-zero file offset used to overflow

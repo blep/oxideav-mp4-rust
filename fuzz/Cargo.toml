@@ -47,12 +47,16 @@ cargo-fuzz = true
 #     overrides, and `tfdt.baseMediaDecodeTime` all participate in
 #     the file-offset arithmetic that locates sample bytes.
 #
-# There is no external system library worth pulling in as a
-# cross-decode oracle (the clean-room wall bars every libisobmff /
-# mp4v2 / Bento4 / GPAC / libavformat as a reference anyway), so
-# this fuzz crate is **demux-only**: feed arbitrary bytes through
-# `demux::open` and then drain `next_packet()` for a bounded number
-# of steps, asserting nothing panics, aborts, or OOMs.
+# There is no external cross-decode oracle worth pulling in (the
+# clean-room wall bars every third-party ISO BMFF implementation as
+# a reference anyway), so the oracle is **ourselves**: six targets
+# split the surface between "arbitrary hostile bytes must open or
+# error, never panic" (demux, box_parsers) and "valid-by-construction
+# recipes must round-trip byte-exactly through our own muxer +
+# demuxer / builder + parser / encrypt + decrypt pairs"
+# (mux_roundtrip, meta_graph, cenc_roundtrip), with structured_mutate
+# corrupting writer-shaped fixtures so the fuzzer starts deep inside
+# the box tree instead of fishing for a parseable moov.
 [dependencies]
 libfuzzer-sys = "0.4"
 oxideav-core = "0.1"
@@ -67,8 +71,66 @@ members = ["."]
 [profile.release]
 debug = 1
 
+# Shared scaffolding: the Recipe byte-reader, the valid-by-construction
+# MuxPlan (plain / faststart / fragmented layouts), and the full-accessor
+# demux exercise battery every hostile target funnels into.
+[lib]
+name = "oxideav_mp4_fuzz"
+path = "src/lib.rs"
+test = false
+doc = false
+
+# Target 1: arbitrary hostile bytes through the typed demuxer open
+# front + full accessor battery + bounded drain + both seek paths.
 [[bin]]
 name = "demux"
 path = "fuzz_targets/demux.rs"
+test = false
+doc = false
+
+# Target 2: hostile bytes through every standalone public box parser
+# (HEIF item catalogue, CENC/PIFF, emsg, FD, hint, sample-group blobs,
+# QuickTime atoms, aux-info/random-access records), with parse∘build
+# fixed-point asserts wherever the byte-exact builder dual exists.
+[[bin]]
+name = "box_parsers"
+path = "fuzz_targets/box_parsers.rs"
+test = false
+doc = false
+
+# Target 3: valid-by-construction mux recipes must round-trip — mux,
+# re-open, byte-exact payloads + pts (plain / faststart / fragmented
+# incl. styp + sidx/mfra indexes, edit lists, empty-time gaps).
+[[bin]]
+name = "mux_roundtrip"
+path = "fuzz_targets/mux_roundtrip.rs"
+test = false
+doc = false
+
+# Target 4: structure-aware corruption of writer-shaped fixtures —
+# byte flips, truncations, and targeted overwrites right after the
+# sample-table / fragment / index FourCCs the offset walkers
+# arithmetic on.
+[[bin]]
+name = "structured_mutate"
+path = "fuzz_targets/structured_mutate.rs"
+test = false
+doc = false
+
+# Target 5: HEIF item graphs — builder-assembled iloc/iinf/iref/ipma
+# catalogues (cycles, dangling IDs, every construction method) must
+# reparse identically, then survive hostile mutation of the meta body.
+[[bin]]
+name = "meta_graph"
+path = "fuzz_targets/meta_graph.rs"
+test = false
+doc = false
+
+# Target 6: CENC — encrypt∘decrypt identity under arbitrary-but-valid
+# §10 scheme × tenc × subsample-partition metadata, hostile
+# plan_sample_cipher walks, and hostile senc/seig parses.
+[[bin]]
+name = "cenc_roundtrip"
+path = "fuzz_targets/cenc_roundtrip.rs"
 test = false
 doc = false

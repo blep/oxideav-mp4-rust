@@ -140,11 +140,15 @@ fn each_child<F: FnMut([u8; 4], &[u8])>(body: &[u8], mut f: F) {
         } else {
             (size32 as usize, 8usize)
         };
-        if total < hdr_len || pos + total > body.len() {
-            break;
-        }
-        f(fourcc, &body[pos + hdr_len..pos + total]);
-        pos += total;
+        // §4.2: a declared (large)size must land inside the enclosing
+        // container. `largesize` is attacker-controlled 64-bit — the
+        // bound check must not itself overflow `pos + total`.
+        let end = match pos.checked_add(total) {
+            Some(e) if total >= hdr_len && e <= body.len() => e,
+            _ => break,
+        };
+        f(fourcc, &body[pos + hdr_len..end]);
+        pos = end;
     }
 }
 
@@ -573,6 +577,23 @@ pub fn build_feci_box(b: &FeciBox) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a §4.2 `largesize`-encoded child whose declared size
+    /// is near `u64::MAX` must not overflow the container walker's
+    /// `pos + total` bound check (found by the r443 box_parsers fuzz
+    /// campaign). The child is dropped; the walk terminates cleanly.
+    #[test]
+    fn each_child_rejects_overflowing_largesize() {
+        // One child header: size32 = 1 (largesize follows), fourcc,
+        // then largesize = u64::MAX.
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(b"junk");
+        body.extend_from_slice(&u64::MAX.to_be_bytes());
+        let mut seen = 0usize;
+        each_child(&body, |_, _| seen += 1);
+        assert_eq!(seen, 0, "overflowing largesize child must be dropped");
+    }
 
     /// Strip a `[size:u32][fourcc]` header, asserting the size field
     /// matches the total length and the fourcc matches.

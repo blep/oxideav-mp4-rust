@@ -132,11 +132,15 @@ fn each_child<F: FnMut([u8; 4], &[u8])>(body: &[u8], mut f: F) {
         } else {
             size as usize
         };
-        if total < 8 || pos + total > body.len() {
-            break;
-        }
-        f(fourcc, &body[pos + 8..pos + total]);
-        pos += total;
+        // §4.2 bound check with overflow-safe arithmetic (the declared
+        // size is attacker-controlled; on 32-bit targets `pos + total`
+        // could otherwise wrap).
+        let end = match pos.checked_add(total) {
+            Some(e) if total >= 8 && e <= body.len() => e,
+            _ => break,
+        };
+        f(fourcc, &body[pos + 8..end]);
+        pos = end;
     }
 }
 
@@ -501,6 +505,22 @@ pub fn build_hinf_box(s: &HintStatistics) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the `hinf` child walker must not overflow its
+    /// `pos + total` bound check on a hostile `size == 0` ("to end")
+    /// child that leaves fewer than 8 bytes, or on a size larger than
+    /// the body (r443 fuzz-campaign hardening, mirroring the `fd`
+    /// each_child fix).
+    #[test]
+    fn each_child_rejects_oversize_child() {
+        let mut body = Vec::new();
+        // size32 far larger than the 8-byte body: dropped.
+        body.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        body.extend_from_slice(b"junk");
+        let mut seen = 0usize;
+        each_child(&body, |_, _| seen += 1);
+        assert_eq!(seen, 0, "oversize child must be dropped, not walked");
+    }
 
     fn unwrap_box<'a>(bytes: &'a [u8], fourcc: &[u8; 4]) -> &'a [u8] {
         let total = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;

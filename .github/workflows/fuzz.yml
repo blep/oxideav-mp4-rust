@@ -1,0 +1,41 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. The MP4 /
+# ISO Base Media File Format container is a length-prefixed box tree
+# (`size:u32 / type:FourCC [/ largesize:u64]`, ISO/IEC 14496-12 §4.2)
+# whose every nesting level — `moov > trak > mdia > minf > stbl`, the
+# parallel fragmented `moof > traf > trun`, the file-level `meta` HEIF
+# item catalogue, and the CENC encryption framing — is driven by
+# attacker-controlled length and count fields. Six targets share the
+# budget:
+#
+#   * demux           — arbitrary bytes must open-or-error through the
+#                       typed front + full accessor battery + bounded
+#                       drain + both seek paths, never panic/OOM;
+#   * box_parsers     — every standalone public box parser, with
+#                       parse∘build fixed-point where the byte-exact
+#                       builder dual exists;
+#   * mux_roundtrip   — valid-by-construction recipes must mux and
+#                       re-demux byte-exactly (plain / faststart /
+#                       fragmented incl. styp + sidx/mfra, edit lists);
+#   * structured_mutate — writer-shaped fixtures with fuzz-directed
+#                       flips / truncations / targeted table corruption
+#                       must never panic the demux battery;
+#   * meta_graph      — HEIF item graphs (iloc/iinf/iref/ipma cycles +
+#                       construction methods) reparse identically, then
+#                       survive hostile mutation;
+#   * cenc_roundtrip  — encrypt∘decrypt identity under arbitrary-but-
+#                       valid §10 scheme × tenc × subsample metadata,
+#                       plus hostile plan / senc / seig walks.
+
+on:
+  schedule:
+    - cron: "23 5 * * *"   # daily 05:23 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

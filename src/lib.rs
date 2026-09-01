@@ -13,6 +13,10 @@ pub mod boxes;
 pub mod cenc;
 pub mod cenc_cipher;
 pub mod cenc_packager;
+// Internal plumbing: sample-entry FourCC -> oxideav codec-id mapping used
+// by the demuxer. Not part of the stable API (the README documents no
+// `codec_id::` surface); `pub` only so tests can reach it.
+#[doc(hidden)]
 pub mod codec_id;
 pub mod demux;
 pub mod emsg;

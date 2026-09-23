@@ -7717,7 +7717,16 @@ fn parse_audio_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
             // resolver can disambiguate MP3-in-mp4a vs. AAC-in-mp4a.
             b"esds" if body.len() >= 4 => {
                 if let Some(parsed) = parse_esds(&body[4..]) {
+                    // For AAC (OTI 0x40/0x66/0x67/0x68, or an unlabelled
+                    // `mp4a`), the sample entry's `channel_count` is often a
+                    // placeholder; the real layout is the channel
+                    // configuration in the AudioSpecificConfig. Prefer it.
                     if !parsed.dsi.is_empty() {
+                        if matches!(parsed.oti, None | Some(0x40 | 0x66 | 0x67 | 0x68)) {
+                            if let Some(channels) = asc_channel_count(&parsed.dsi) {
+                                t.channels = Some(channels);
+                            }
+                        }
                         t.extradata = parsed.dsi;
                     }
                     t.esds_oti = parsed.oti;
@@ -7848,6 +7857,85 @@ fn parse_esds(buf: &[u8]) -> Option<EsdsInfo> {
         cur = sub_end;
     }
     Some(info)
+}
+
+/// Channel count from an AAC `AudioSpecificConfig` (ISO/IEC 14496-3
+/// §1.6.2.1): `audioObjectType` (5 bits, extended when 31),
+/// `samplingFrequencyIndex` (4 bits, explicit 24-bit rate when 15) and
+/// `channelConfiguration` (4 bits).
+///
+/// Returns `None` when the config is truncated or the channel
+/// configuration is zero (the layout then lives in a program config
+/// element, which this parser does not decode).
+fn asc_channel_count(asc: &[u8]) -> Option<u16> {
+    // ISO/IEC 14496-3 Table 1.19.
+    const CHANNELS: [u16; 14] = [0, 1, 2, 3, 4, 5, 6, 8, 0, 0, 0, 7, 8, 24];
+    let mut reader = AscBitReader::new(asc);
+    let audio_object_type = reader.read_bits(5)?;
+    if audio_object_type == 31 {
+        reader.read_bits(6)?;
+    }
+    if reader.read_bits(4)? == 0xF {
+        reader.read_bits(24)?;
+    }
+    let channel_configuration = reader.read_bits(4)? as usize;
+    CHANNELS
+        .get(channel_configuration)
+        .copied()
+        .filter(|&channels| channels > 0)
+}
+
+/// MSB-first bit reader for the AudioSpecificConfig.
+struct AscBitReader<'a> {
+    bytes: &'a [u8],
+    bit: usize,
+}
+
+impl<'a> AscBitReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, bit: 0 }
+    }
+
+    fn read_bits(&mut self, count: usize) -> Option<u32> {
+        let mut value = 0u32;
+        for _ in 0..count {
+            let byte = self.bytes.get(self.bit / 8)?;
+            let bit = (byte >> (7 - (self.bit % 8))) & 1;
+            value = (value << 1) | u32::from(bit);
+            self.bit += 1;
+        }
+        Some(value)
+    }
+}
+
+#[cfg(test)]
+mod asc_channel_tests {
+    use super::asc_channel_count;
+
+    #[test]
+    fn reads_5_1_channel_configuration() {
+        // AOT 2, 48 kHz, channelConfiguration 6.
+        assert_eq!(asc_channel_count(&[0x11, 0xB0]), Some(6));
+    }
+
+    #[test]
+    fn reads_mono_channel_configuration() {
+        // AOT 2, 48 kHz, channelConfiguration 1.
+        assert_eq!(asc_channel_count(&[0x11, 0x88]), Some(1));
+    }
+
+    #[test]
+    fn handles_extended_audio_object_type() {
+        // AOT 31 + ext 1 (=> 33), 48 kHz, channelConfiguration 6.
+        assert_eq!(asc_channel_count(&[0xF8, 0x26, 0xC0]), Some(6));
+    }
+
+    #[test]
+    fn rejects_truncated_or_zero_configuration() {
+        assert_eq!(asc_channel_count(&[0x11]), None);
+        // channelConfiguration 0 (layout in a program config element).
+        assert_eq!(asc_channel_count(&[0x11, 0x80]), None);
+    }
 }
 
 /// Back-compat thin wrapper — returns just the DSI bytes.
@@ -11597,6 +11685,14 @@ fn build_stream_info(index: u32, t: &Track, codecs: &dyn CodecResolver) -> Strea
             let tag = CodecTag::mp4_object_type(oti);
             let ctx = build_ctx(&tag, t);
             resolved = codecs.resolve_tag(&ctx);
+            // `mp4a` / `mp4v` sample entries carry many codecs that only the
+            // OTI distinguishes. When no codec crate claims this OTI, fall
+            // back to the static OTI table *before* the generic bare-FourCC
+            // lookup: otherwise the bare `mp4a` tag wins (reporting e.g.
+            // OTI 0x6B as AAC instead of MP3).
+            if resolved.is_none() && matches!(&t.codec_id_fourcc, b"mp4a" | b"mp4v") {
+                resolved = Some(from_sample_entry_with_oti(&t.codec_id_fourcc, oti));
+            }
         }
         if resolved.is_none() {
             let tag = CodecTag::fourcc(&t.codec_id_fourcc);

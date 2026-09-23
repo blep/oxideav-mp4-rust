@@ -7879,10 +7879,49 @@ fn asc_channel_count(asc: &[u8]) -> Option<u16> {
         reader.read_bits(24)?;
     }
     let channel_configuration = reader.read_bits(4)? as usize;
-    CHANNELS
-        .get(channel_configuration)
-        .copied()
-        .filter(|&channels| channels > 0)
+    let mut channels = CHANNELS.get(channel_configuration).copied().unwrap_or(0);
+    // HE-AACv2 (SBR + parametric stereo) signals a mono core but decodes to
+    // stereo, either via `audioObjectType` 29 or via the SBR/PS sync
+    // extension in the ASC; report the output layout.
+    if audio_object_type == 29 && channels < 2 {
+        channels = 2;
+    }
+    if channels == 1 && asc_has_parametric_stereo(asc) {
+        channels = 2;
+    }
+    (channels > 0).then_some(channels)
+}
+
+/// Detect the parametric-stereo (PS) sync extension in an
+/// `AudioSpecificConfig` (ISO/IEC 14496-3 §1.6.2.1): locate the `0x2B7`
+/// sync extension, confirm SBR (`extensionAudioObjectType == 5`,
+/// `sbrPresentFlag == 1`), then read the `0x548` PS sync and its flag.
+fn asc_has_parametric_stereo(asc: &[u8]) -> bool {
+    let total_bits = asc.len() * 8;
+    let mut offset = 0usize;
+    while offset + 33 <= total_bits {
+        if asc_bits_at(asc, offset, 11) == Some(0x2B7)
+            && asc_bits_at(asc, offset + 11, 5) == Some(5)
+            && asc_bits_at(asc, offset + 16, 1) == Some(1)
+            && asc_bits_at(asc, offset + 21, 11) == Some(0x548)
+            && asc_bits_at(asc, offset + 32, 1) == Some(1)
+        {
+            return true;
+        }
+        offset += 1;
+    }
+    false
+}
+
+/// Read `count` bits at an absolute bit offset (MSB-first).
+fn asc_bits_at(buf: &[u8], offset: usize, count: usize) -> Option<u32> {
+    let mut value = 0u32;
+    for index in offset..offset + count {
+        let byte = buf.get(index / 8)?;
+        let bit = (byte >> (7 - (index % 8))) & 1;
+        value = (value << 1) | u32::from(bit);
+    }
+    Some(value)
 }
 
 /// MSB-first bit reader for the AudioSpecificConfig.
@@ -7928,6 +7967,17 @@ mod asc_channel_tests {
     fn handles_extended_audio_object_type() {
         // AOT 31 + ext 1 (=> 33), 48 kHz, channelConfiguration 6.
         assert_eq!(asc_channel_count(&[0xF8, 0x26, 0xC0]), Some(6));
+    }
+
+    #[test]
+    fn promotes_he_aacv2_mono_core_to_stereo() {
+        // AOT 29 (HE-AACv2), 48 kHz, channelConfiguration 1 => stereo out.
+        assert_eq!(asc_channel_count(&[0xE9, 0x88]), Some(2));
+        // HE-AACv2 via the PS sync extension (real MP4 extradata).
+        assert_eq!(
+            asc_channel_count(&[0x13, 0x88, 0x56, 0xE5, 0xA5, 0x48, 0x80]),
+            Some(2)
+        );
     }
 
     #[test]

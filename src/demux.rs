@@ -7561,6 +7561,18 @@ fn parse_sample_entry(entry: &[u8], t: &mut Track) -> Result<()> {
         t.tmcd = parse_tmcd_sample_entry(entry);
         return Ok(());
     }
+    // The legacy QuickTime plain-text sample entry (`text`) is not
+    // subtitle carriage: ffmpeg classifies it as `bin_data` / data, and
+    // only `tx3g` / `c608` / `c708` / `wvtt` / `stpp` / `sbtt` / `stxt`
+    // carry subtitles. The `text` *handler* is shared with `tx3g`
+    // mov_text tracks, so the distinction must be made on the sample
+    // entry, not the handler. Parse the entry for its text metadata,
+    // then reclassify the track as Data.
+    if t.media_type == MediaType::Subtitle && t.codec_id_fourcc == *b"text" {
+        let parsed = parse_subtitle_sample_entry(entry, t);
+        t.media_type = MediaType::Data;
+        return parsed;
+    }
     match t.media_type {
         MediaType::Audio => parse_audio_sample_entry(entry, t),
         MediaType::Video => parse_video_sample_entry(entry, t),

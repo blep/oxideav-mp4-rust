@@ -88,7 +88,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // can anchor a v0 `presentation_time_delta` to the right
     // fragment's earliest presentation time.
     let mut emsgs: Vec<EmsgRecord> = Vec::new();
-    while let Some(hdr) = read_box_header(&mut *input)? {
+    while let Some(hdr) = read_box_header_lenient(&mut *input)? {
         match hdr.fourcc {
             FTYP => {
                 saw_ftyp = true;

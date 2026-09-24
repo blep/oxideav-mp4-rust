@@ -33,6 +33,21 @@ impl BoxHeader {
 }
 
 pub fn read_box_header<R: Read + Seek + ?Sized>(r: &mut R) -> Result<Option<BoxHeader>> {
+    read_box_header_inner(r, false)
+}
+
+/// Like [`read_box_header`], but a partial header at end-of-input (trailing
+/// bytes that cannot form a box) is treated as end-of-stream rather than an
+/// error. The top-level walker uses this because trailing garbage is common
+/// and ignored by other readers; the nested container parsers stay strict.
+pub fn read_box_header_lenient<R: Read + Seek + ?Sized>(r: &mut R) -> Result<Option<BoxHeader>> {
+    read_box_header_inner(r, true)
+}
+
+fn read_box_header_inner<R: Read + Seek + ?Sized>(
+    r: &mut R,
+    lenient: bool,
+) -> Result<Option<BoxHeader>> {
     let start = r.stream_position()?;
 
     let mut hdr = [0u8; 8];
@@ -40,7 +55,7 @@ pub fn read_box_header<R: Read + Seek + ?Sized>(r: &mut R) -> Result<Option<BoxH
     while got < 8 {
         match r.read(&mut hdr[got..]) {
             Ok(0) => {
-                if got == 0 {
+                if got == 0 || lenient {
                     return Ok(None);
                 } else {
                     return Err(Error::invalid("MP4: truncated box header"));
